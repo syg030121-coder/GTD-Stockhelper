@@ -18,6 +18,6 @@ FONT_TITLE = ("Segoe UI", 24, "bold")
 FONT_SUBTITLE = ("Segoe UI", 16, "bold")
 FONT_BODY = ("Segoe UI", 12)
 
-# ── Gemini AI API 키 ──────────────────────────────────────────────────
-# 환경 변수 GEMINI_API_KEY 또는 아래에 직접 입력하세요
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6LAek_3LWTnfJ1Ik7PzwiNMwa5OuKk1oO6LG3E5I4HDJg")
+# Gemini AI API key
+# Set GEMINI_API_KEY in the process environment; do not store secrets in source.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")

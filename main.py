@@ -1786,7 +1786,7 @@ class GTDApp:
                     api_key = config.GEMINI_API_KEY
                     if not api_key:
                         self.root.after(0, lambda: _show_ai_error(
-                            "API 키가 없습니다.\nconfig.py 파일에 GEMINI_API_KEY를 입력해주세요."))
+                            "API 키가 없습니다.\nGEMINI_API_KEY 환경 변수를 설정해주세요."))
                         return
                     client = gai.Client(api_key=api_key)
 
