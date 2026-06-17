@@ -10,10 +10,14 @@ USER_DB_PATH = os.path.join(DATA_DIR, "users.csv")
 PORTFOLIO_DB_PATH = os.path.join(DATA_DIR, "portfolios.csv")
 
 # 모던 UI 테마 정의
-APPEARANCE_MODE = "dark" # 어두운 다크 모드 스타일
-THEME_COLOR = "blue"     # 버튼 등 포인트 컬러
+APPEARANCE_MODE = "light" # 밝은 토스 스타일 라이트 모드
+THEME_COLOR = "blue"     # 포인트 블루 컬러
 
 # 폰트 통합 설정
-FONT_TITLE = ("Pretendard", 24, "bold")
-FONT_SUBTITLE = ("Pretendard", 16, "bold")
-FONT_BODY = ("Pretendard", 12)
+FONT_TITLE = ("Segoe UI", 24, "bold")
+FONT_SUBTITLE = ("Segoe UI", 16, "bold")
+FONT_BODY = ("Segoe UI", 12)
+
+# ── Gemini AI API 키 ──────────────────────────────────────────────────
+# 환경 변수 GEMINI_API_KEY 또는 아래에 직접 입력하세요
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6LAek_3LWTnfJ1Ik7PzwiNMwa5OuKk1oO6LG3E5I4HDJg")
