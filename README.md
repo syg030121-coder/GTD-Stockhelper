@@ -1,5 +1,7 @@
 #1분 시연 동영상
 
+https://github.com/user-attachments/assets/f64eedf1-b677-49cc-9b6e-6b9e4fd87ad2
+
 
 
 
