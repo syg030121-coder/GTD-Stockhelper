@@ -3,6 +3,7 @@ import datetime
 import urllib.parse
 import requests
 import threading
+import re
 from PIL import Image, ImageTk, ImageDraw
 import io
 import customtkinter as ctk
@@ -17,35 +18,50 @@ class GTDApp:
         # 1. 테마 및 포인트 색상 설정 (토스 스타일 라이트 모드)
         ctk.set_appearance_mode(config.APPEARANCE_MODE)
         ctk.set_default_color_theme(config.THEME_COLOR)
-        
+        ctk.set_widget_scaling(0.75)
+
         # 2. 로컬 스토리지 데이터베이스 파일 초기화
         self.init_storage()
         self.current_user = None
         self.active_tab = "dashboard"
-        
+
         # 3. 폰트 동적 정의
         try:
-            available = [f.lower() for f in font.families()]
-            if "pretendard" in available:
-                self.font_family = "Pretendard"
-            elif "segoe ui" in available:
-                self.font_family = "Segoe UI"
-            else:
-                self.font_family = "Malgun Gothic"
+            available = {f.lower(): f for f in font.families()}
+            font_candidates = [
+                "Toss Moneygraphy",
+                "TossMoneygraphy",
+                "Toss Money Graphy",
+                "토스 머니그라피",
+                "토스머니그라피",
+                "머니그라피",
+                "Moneygraphy",
+                "Pretendard",
+                "Malgun Gothic",
+                "Segoe UI",
+            ]
+            self.font_family = "Segoe UI"
+            for candidate in font_candidates:
+                resolved = available.get(candidate.lower())
+                if resolved:
+                    self.font_family = resolved
+                    break
         except Exception:
             self.font_family = "Segoe UI"
-            
+
         # 4. 캐시 및 데이터 상태 변수 설정
         self.logo_cache = {}
         self.logo_is_fallback = {}
+        self.brand_logo_image = None
         self.stock_info_cache = {}
         self.daily_news_cache = None
         self.daily_news_cache_date = None
+        self.daily_news_cache_time = None
         self.search_timer = None
-        
+
         # 💡 이전에 불러오지 않은 뉴스 필터링용 히스토리 셋
         self.shown_news_titles = set()
-        
+
         # 📊 국내 주식 섹터 및 해외 대조군 주식 매핑 사전 구축
         self.sector_map = {
             "005930": {"sector": "반도체", "us_symbol": "MU", "us_name": "Micron Technology"},
@@ -58,20 +74,21 @@ class GTDApp:
             "000720": {"sector": "건설", "us_symbol": "CAT", "us_name": "Caterpillar Inc."},
             "068270": {"sector": "바이오/제약", "us_symbol": "PFE", "us_name": "Pfizer Inc."}
         }
-        
+
         # 5. 메인 윈도우 생성
         self.root = ctk.CTk()
         self.root.title("GTD - 근거있는 투자 도우미")
-        self.root.state("zoomed")
+        self.root.geometry("820x600+10+10")
+        self.root.minsize(760, 520)
         self.root.configure(fg_color="#F9FAFB")
-        
+
         # 글로벌 새로고침 단축키 바인딩
         self.root.bind("<F5>", lambda e: self.handle_global_refresh())
-        
+
         # 최상위 컨테이너 생성
         self.main_container = ctk.CTkFrame(self.root, fg_color="transparent")
         self.main_container.pack(fill="both", expand=True)
-        
+
         # 초기 페이지 호출 (로그인 화면)
         self.show_auth_page()
         self.root.mainloop()
@@ -94,11 +111,415 @@ class GTDApp:
         w = getattr(self, name, None)
         return w is not None and w.winfo_exists()
 
+    def get_brand_logo_image(self):
+        if self.brand_logo_image is not None:
+            return self.brand_logo_image
+
+        logo_path = os.path.join(config.BASE_DIR, "assets", "gtd_logo.png")
+        if not os.path.exists(logo_path):
+            return None
+
+        try:
+            src = Image.open(logo_path).convert("RGBA")
+            src = src.crop((110, 60, 530, 315))
+            self.brand_logo_image = ctk.CTkImage(
+                light_image=src,
+                dark_image=src,
+                size=(190, 115),
+            )
+            return self.brand_logo_image
+        except Exception:
+            return None
+
+    def _use_compact_dashboard(self):
+        try:
+            widget_scale = ctk.ScalingTracker.get_widget_scaling(self.root)
+        except Exception:
+            widget_scale = 1.0
+        return self.root.winfo_screenwidth() <= 1600 or widget_scale >= 1.5
+
+    def _content_wraplength(self, max_width=620, min_width=320, reserve=420):
+        try:
+            width = self.content_area.winfo_width() or self.root.winfo_width()
+        except Exception:
+            width = self.root.winfo_screenwidth()
+        return max(min_width, min(max_width, width - reserve))
+
+    def _render_card_header(self, parent, title, subtitle="", title_color="#191F28"):
+        header = ctk.CTkFrame(parent, fg_color="transparent")
+        header.pack(fill="x", padx=20, pady=(18, 8))
+        ctk.CTkLabel(
+            header,
+            text=title,
+            font=(self.font_family, 18, "bold"),
+            text_color=title_color,
+        ).pack(anchor="w")
+        if subtitle:
+            ctk.CTkLabel(
+                header,
+                text=subtitle,
+                font=(self.font_family, 12),
+                text_color="#8B95A1",
+                wraplength=self._content_wraplength(max_width=620, reserve=460),
+                justify="left",
+            ).pack(anchor="w", pady=(3, 0))
+
+    def _render_dashboard_notice(self, parent):
+        notice = ctk.CTkFrame(parent, fg_color="#FFF7E8", corner_radius=14)
+        notice.pack(fill="x", padx=30, pady=(0, 14))
+        badge = ctk.CTkLabel(
+            notice,
+            text="초보자 모드",
+            width=86,
+            height=30,
+            font=(self.font_family, 12, "bold"),
+            text_color="#8F6B00",
+            fg_color="#FFE8B0",
+            corner_radius=15,
+        )
+        badge.pack(side="left", padx=(18, 12), pady=14)
+        ctk.CTkLabel(
+            notice,
+            text="1 투자 상태 -> 2 뉴스 -> 3 관심 종목",
+            font=(self.font_family, 14, "bold"),
+            text_color="#4E5968",
+            wraplength=460,
+            anchor="w",
+            justify="left",
+        ).pack(side="left", fill="x", expand=True, padx=(0, 18), pady=14)
+
+    def _render_market_overview(self, parent):
+        overview = ctk.CTkFrame(
+            parent,
+            fg_color="#FFFFFF",
+            border_width=1,
+            border_color="#E5E8EB",
+            corner_radius=18,
+        )
+        overview.pack(fill="x", padx=30, pady=(0, 14))
+
+        top = ctk.CTkFrame(overview, fg_color="transparent")
+        top.pack(fill="x", padx=20, pady=(16, 6))
+        compact = self._use_compact_dashboard()
+        title_lbl = ctk.CTkLabel(
+            top,
+            text="시장 한눈에 보기",
+            font=(self.font_family, 17, "bold"),
+            text_color="#191F28",
+        )
+        desc_lbl = ctk.CTkLabel(
+            top,
+            text="처음엔 가격보다 방향과 영향을 먼저 봐도 충분해요",
+            font=(self.font_family, 12),
+            text_color="#8B95A1",
+            anchor="w",
+            wraplength=440,
+            justify="left",
+        )
+        if compact:
+            title_lbl.pack(anchor="w")
+            desc_lbl.pack(anchor="w", pady=(2, 0))
+        else:
+            title_lbl.pack(side="left")
+            desc_lbl.pack(side="right")
+
+        grid = ctk.CTkFrame(overview, fg_color="transparent")
+        grid.pack(fill="x", padx=12, pady=(0, 14))
+        columns = 2 if compact else 4
+        for col in range(columns):
+            grid.columnconfigure(col, weight=1, uniform="market")
+
+        items = [
+            ("D-2", "경제일정", "변동성 체크", "#4E5968", "#F2F4F6"),
+            ("환율", "달러/원", "해외주식 영향", "#B78103", "#FFF7E8"),
+            ("국내장", "국내지수", "국내 종목 분위기", "#3182F6", "#E8F3FF"),
+            ("해외장", "나스닥", "미국장 흐름", "#F04452", "#FFECEF"),
+        ]
+        for index, (badge_text, title, caption, color, bg) in enumerate(items):
+            cell = ctk.CTkFrame(grid, fg_color="transparent", height=60)
+            cell.grid(row=index // columns, column=index % columns, sticky="ew", padx=5, pady=4)
+            cell.pack_propagate(False)
+            ctk.CTkLabel(
+                cell,
+                text=badge_text,
+                width=42,
+                height=30,
+                font=(self.font_family, 11, "bold"),
+                text_color=color,
+                fg_color=bg,
+                corner_radius=12,
+            ).pack(side="left", padx=(0, 8), pady=17)
+            text_box = ctk.CTkFrame(cell, fg_color="transparent")
+            text_box.pack(side="left", fill="both", expand=True, pady=10)
+            ctk.CTkLabel(
+                text_box,
+                text=title,
+                font=(self.font_family, 13, "bold"),
+                text_color="#191F28",
+                anchor="w",
+            ).pack(anchor="w")
+            ctk.CTkLabel(
+                text_box,
+                text=caption,
+                font=(self.font_family, 10),
+                text_color="#8B95A1",
+                anchor="w",
+                wraplength=120,
+                justify="left",
+            ).pack(anchor="w", fill="x")
+
+    def _build_naver_news_url(self, query):
+        """네이버 뉴스 검색을 최근 24시간, 최신순으로 고정."""
+        params = {
+            "where": "news",
+            "query": query,
+            "sm": "tab_opt",
+            "sort": "1",
+            "photo": "0",
+            "field": "0",
+            "pd": "1",
+            "nso": "so:dd,p:1d,a:all",
+        }
+        return "https://search.naver.com/search.naver?" + urllib.parse.urlencode(params)
+
+    def _parse_news_published_at(self, time_text, now=None):
+        if not time_text:
+            return None
+        now = now or datetime.datetime.now()
+        text = time_text.strip()
+
+        if "방금" in text:
+            return now
+
+        rel_patterns = [
+            (r"(\d+)\s*초\s*전", "seconds"),
+            (r"(\d+)\s*분\s*전", "minutes"),
+            (r"(\d+)\s*시간\s*전", "hours"),
+        ]
+        for pattern, unit in rel_patterns:
+            m = re.search(pattern, text)
+            if m:
+                value = int(m.group(1))
+                return now - datetime.timedelta(**{unit: value})
+
+        # "1일 전"은 실제로 24시간을 넘길 수 있어 최신 24시간 기사에서 제외한다.
+        if re.search(r"\d+\s*일\s*전", text):
+            return None
+
+        m = re.search(r"(\d{4})\.(\d{1,2})\.(\d{1,2})\.", text)
+        if m:
+            return datetime.datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+        m = re.search(r"(?<!\d)(\d{1,2})\.(\d{1,2})\.", text)
+        if m:
+            return datetime.datetime(now.year, int(m.group(1)), int(m.group(2)))
+
+        return None
+
+    def _is_within_24h(self, published_at, now=None):
+        if not published_at:
+            return False
+        now = now or datetime.datetime.now()
+        delta = now - published_at
+        return datetime.timedelta(seconds=-60) <= delta <= datetime.timedelta(hours=24)
+
+    def _format_news_age(self, published_at, raw_label=""):
+        if raw_label and ("전" in raw_label or "방금" in raw_label):
+            return raw_label
+        if not published_at:
+            return "최근 24시간"
+
+        delta = max(datetime.timedelta(), datetime.datetime.now() - published_at)
+        minutes = int(delta.total_seconds() // 60)
+        if minutes < 1:
+            return "방금 전"
+        if minutes < 60:
+            return f"{minutes}분 전"
+        return f"{minutes // 60}시간 전"
+
+    def _extract_news_time(self, container):
+        if not container:
+            return "", None
+
+        candidates = []
+        for node in container.find_all(["span", "em"]):
+            text = node.get_text(" ", strip=True)
+            if text:
+                candidates.append(text)
+
+        full_text = container.get_text(" ", strip=True)
+        candidates.extend(re.findall(r"방금 전|\d+\s*(?:초|분|시간|일)\s*전|\d{4}\.\d{1,2}\.\d{1,2}\.|\d{1,2}\.\d{1,2}\.", full_text))
+
+        for text in candidates:
+            published_at = self._parse_news_published_at(text)
+            if published_at and self._is_within_24h(published_at):
+                return text, published_at
+        return "", None
+
+    def _classify_news_sentiment(self, text):
+        pos_words = [
+            "상승", "급등", "반등", "강세", "호재", "수혜", "계약", "수주", "체결",
+            "상향", "최고", "성장", "증가", "개선", "흑자", "돌파", "완화", "승인",
+            "유치", "확대", "순항", "기대", "매수",
+        ]
+        neg_words = [
+            "하락", "급락", "약세", "악재", "우려", "부진", "감소", "적자", "손실",
+            "악화", "갈등", "규제", "쇼크", "하향", "둔화", "소송", "분쟁", "리콜",
+            "불확실", "경고", "매도",
+        ]
+
+        source = text.lower()
+        pos_hits = [word for word in pos_words if word.lower() in source]
+        neg_hits = [word for word in neg_words if word.lower() in source]
+
+        if pos_hits and neg_hits and abs(len(pos_hits) - len(neg_hits)) <= 1:
+            return "복합", "긍정/부정 키워드가 함께 감지됨"
+        if len(pos_hits) > len(neg_hits):
+            return "호재", "긍정 키워드: " + ", ".join(pos_hits[:3])
+        if len(neg_hits) > len(pos_hits):
+            return "악재", "부정 키워드: " + ", ".join(neg_hits[:3])
+        return "복합", "제목만으로는 방향성이 뚜렷하지 않음"
+
+    def _build_local_news_analysis(self, news_title, sentiment, sentiment_reason):
+        if sentiment == "호재":
+            return f"""[핵심 이유]
+{sentiment_reason or "긍정적인 키워드가 감지되었습니다."} 투자자들이 실적 개선, 수주, 정책 수혜 같은 긍정 신호로 해석할 수 있는 제목입니다.
+
+[주식시장에 미치는 영향]
+관련 종목이나 같은 섹터의 투자 심리가 단기적으로 좋아질 수 있습니다.
+
+[주의할 점]
+제목 기반 분석이므로 실제 기사 본문, 실적 수치, 공시 여부를 함께 확인해야 합니다."""
+        if sentiment == "악재":
+            return f"""[핵심 이유]
+{sentiment_reason or "부정적인 키워드가 감지되었습니다."} 투자자들이 실적 둔화, 규제, 손실, 수요 약화 같은 리스크로 받아들일 수 있는 제목입니다.
+
+[주식시장에 미치는 영향]
+관련 종목이나 같은 섹터의 매도 압력이 커지거나 변동성이 확대될 수 있습니다.
+
+[대응 방법]
+손절 기준, 보유 비중, 추가 뉴스 확인 여부를 먼저 점검하는 것이 좋습니다."""
+        return f"""[핵심 이유]
+{sentiment_reason or "긍정과 부정 방향이 뚜렷하게 갈리지 않습니다."} 제목만 보면 호재와 악재가 섞였거나 시장 영향이 아직 확정되지 않은 이슈입니다.
+
+[주식시장에 미치는 영향]
+초기 반응은 종목별 수급과 후속 보도에 따라 엇갈릴 수 있습니다.
+
+[확인할 점]
+기사 본문에서 실제 수치, 기업명, 정책 확정 여부를 확인해 방향성을 다시 판단해야 합니다."""
+
+    def _get_news_symbol_from_title(self, title):
+        if "삼성" in title:
+            return "005930.KS"
+        if "SK" in title or "하이닉스" in title:
+            return "000660.KS"
+        if "엔비디아" in title or "젠슨황" in title:
+            return "NVDA"
+        if "마이크론" in title:
+            return "MU"
+        if "테슬라" in title:
+            return "TSLA"
+        if "애플" in title:
+            return "AAPL"
+        return "GENERIC"
+
+    def _is_probable_news_title_link(self, anchor):
+        title = anchor.get_text(" ", strip=True)
+        href = anchor.get("href", "")
+        if not href.startswith("http") or len(title) < 10 or len(title) > 140:
+            return False
+
+        blocked_hrefs = [
+            "keep.naver.com",
+            "search.shopping.naver.com",
+            "news.naver.com/main/static",
+            "www.naver.com",
+            "search.naver.com",
+        ]
+        if any(blocked in href for blocked in blocked_hrefs):
+            return False
+
+        blocked_texts = [
+            "Keep에",
+            "바로가기",
+            "구독하세요",
+            "메뉴 영역",
+            "본문 영역",
+            "언론사 선정",
+        ]
+        return not any(blocked in title for blocked in blocked_texts)
+
+    def _find_news_container_with_time(self, anchor):
+        node = anchor
+        for _ in range(7):
+            node = node.find_parent()
+            if not node:
+                break
+            time_label, published_at = self._extract_news_time(node)
+            if published_at:
+                return node, time_label, published_at
+        return anchor.parent, "", None
+
+    def _open_url(self, link):
+        if link and str(link).startswith("http"):
+            webbrowser.open_new_tab(link)
+
+    def _fetch_recent_naver_news(self, query, limit=3, seen_titles=None):
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        seen_titles = seen_titles if seen_titles is not None else set()
+        results = []
+        res = requests.get(self._build_naver_news_url(query), headers=headers, timeout=3)
+        if res.status_code != 200:
+            return results
+
+        soup = BeautifulSoup(res.text, 'html.parser')
+        anchors = soup.find_all('a', class_='news_tit')
+        if not anchors:
+            anchors = [a for a in soup.find_all('a') if self._is_probable_news_title_link(a)]
+
+        seen_links = set()
+        for a in anchors:
+            title = a.get_text(" ", strip=True)
+            href = a.get('href', '')
+            if not href.startswith('http') or len(title) < 10:
+                continue
+            if title in seen_titles or href in seen_links:
+                continue
+
+            container = (
+                a.find_parent('div', class_='news_area')
+                or a.find_parent('li')
+                or a.parent
+            )
+            time_label, published_at = self._extract_news_time(container)
+            if not published_at:
+                container, time_label, published_at = self._find_news_container_with_time(a)
+            if not self._is_within_24h(published_at):
+                continue
+
+            sentiment, reason = self._classify_news_sentiment(title)
+            seen_titles.add(title)
+            seen_links.add(href)
+            results.append({
+                "title": title,
+                "symbol": self._get_news_symbol_from_title(title),
+                "sentiment": sentiment,
+                "sentiment_reason": reason,
+                "link": href,
+                "age_label": self._format_news_age(published_at, time_label),
+                "published_at": published_at.isoformat(timespec="minutes"),
+            })
+            if len(results) >= limit:
+                break
+        return results
+
     def show_auth_page(self):
         """로그인 및 회원가입 인증 화면 렌더링"""
         self.clear_container()
         self.main_container.configure(fg_color="#F2F4F6")
-        
+
         # 로그인 카드 프레임
         card = ctk.CTkFrame(self.main_container, fg_color="#FFFFFF", border_width=1, border_color="#E5E8EB", corner_radius=24, width=420, height=480)
         card.place(relx=0.5, rely=0.5, anchor="center")
@@ -178,28 +599,34 @@ class GTDApp:
         """대시보드 메인 레이아웃 렌더링"""
         self.clear_container()
         self.main_container.configure(fg_color="#F9FAFB")
-        
+
         # 1. 좌측 사이드바 패널
-        self.sidebar = ctk.CTkFrame(self.main_container, width=240, fg_color="#FFFFFF", corner_radius=0, border_width=1, border_color="#E5E8EB")
+        self.sidebar = ctk.CTkFrame(self.main_container, width=220, fg_color="#FFFFFF", corner_radius=0, border_width=1, border_color="#E5E8EB")
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
-        
+
         # 2. 우측 메인 콘텐츠 프레임
         self.content_area = ctk.CTkFrame(self.main_container, fg_color="#F9FAFB", corner_radius=0)
         self.content_area.pack(side="right", fill="both", expand=True)
-        
+
         self.render_sidebar()
         self.switch_tab("dashboard")
 
     def render_sidebar(self):
-        ctk.CTkLabel(self.sidebar, text="📊 GTD", font=(self.font_family, 32, "bold"), text_color="#3182F6").pack(pady=(30, 4), padx=25, anchor="w")
-        ctk.CTkLabel(self.sidebar, text="근거있는 투자 도우미", font=(self.font_family, 13, "bold"), text_color="#8B95A1").pack(pady=(0, 40), padx=25, anchor="w")
+        brand_logo = self.get_brand_logo_image()
+        if brand_logo:
+            ctk.CTkLabel(self.sidebar, text="", image=brand_logo).pack(
+                pady=(24, 42), padx=24, anchor="w"
+            )
+        else:
+            ctk.CTkLabel(self.sidebar, text="📊 GTD", font=(self.font_family, 32, "bold"), text_color="#3182F6").pack(pady=(30, 4), padx=25, anchor="w")
+            ctk.CTkLabel(self.sidebar, text="근거있는 투자 도우미", font=(self.font_family, 13, "bold"), text_color="#8B95A1").pack(pady=(0, 40), padx=25, anchor="w")
 
         tabs = [
             ("dashboard", "대시보드"),
             ("portfolio", "나의 종목")
         ]
-        
+
         self.sidebar_buttons = {}
         for tab_id, tab_title in tabs:
             btn = ctk.CTkButton(
@@ -252,20 +679,52 @@ class GTDApp:
         # ── 스크롤 가능한 전체 컨텐츠 래퍼
         dash_scroll = ctk.CTkScrollableFrame(self.content_area, fg_color="transparent")
         dash_scroll.pack(fill="both", expand=True)
+        try:
+            dash_scroll._parent_canvas.bind(
+                "<Configure>",
+                lambda event, frame=dash_scroll: frame._parent_canvas.itemconfigure(
+                    frame._create_window_id, width=min(event.width, 700)
+                )
+            )
+        except Exception:
+            pass
 
         # ── 헤더 ──────────────────────────────────────────────────────
         header_frame = ctk.CTkFrame(dash_scroll, fg_color="transparent")
-        header_frame.pack(fill="x", padx=30, pady=(25, 10))
-        ctk.CTkLabel(header_frame, text=f"{self.current_user}님 환영합니다!",
-                     font=(self.font_family, 24, "bold"), text_color="#191F28").pack(side="left")
+        header_frame.pack(fill="x", padx=30, pady=(24, 10))
+        header_text = ctk.CTkFrame(header_frame, fg_color="transparent")
+        header_text.pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(
+            header_text,
+            text="오늘 뭐부터 볼까요?",
+            font=(self.font_family, 24, "bold"),
+            text_color="#191F28",
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            header_text,
+            text=f"{self.current_user}님, 내 종목과 최근 뉴스부터 확인해요.",
+            font=(self.font_family, 13),
+            text_color="#8B95A1",
+            wraplength=520,
+            justify="left",
+        ).pack(anchor="w", pady=(2, 0))
         ctk.CTkButton(header_frame, text="새로고침", width=90, height=34,
                       font=(self.font_family, 13, "bold"),
                       fg_color="#E8F3FF", text_color="#3182F6",
                       hover_color="#D0E6FF", corner_radius=10,
-                      command=self.handle_global_refresh).pack(side="right")
+                      command=self.handle_global_refresh).pack(side="right", padx=(12, 0))
+
+        self._render_dashboard_notice(dash_scroll)
+        self._render_market_overview(dash_scroll)
 
         # ── 총 투자 수익률 배너 ─────────────────────────────────────────
-        self.return_banner = ctk.CTkFrame(dash_scroll, fg_color="#1B2033", corner_radius=20)
+        self.return_banner = ctk.CTkFrame(
+            dash_scroll,
+            fg_color="#FFFFFF",
+            border_width=1,
+            border_color="#E5E8EB",
+            corner_radius=20,
+        )
         self.return_banner.pack(fill="x", padx=30, pady=(0, 14))
         self._return_banner_loading()
 
@@ -275,11 +734,16 @@ class GTDApp:
         alloc_card.pack(fill="x", padx=30, pady=(0, 14))
         alloc_hdr = ctk.CTkFrame(alloc_card, fg_color="transparent")
         alloc_hdr.pack(fill="x", padx=20, pady=(16, 6))
-        ctk.CTkLabel(alloc_hdr, text="나의 투자 비율",
+        ctk.CTkLabel(alloc_hdr, text="내 돈이 어디에 들어가 있나요?",
                      font=(self.font_family, 16, "bold"), text_color="#191F28").pack(side="left")
-
-        # (개별 차트 범례 표시로 대체하여 상단 글로벌 범례 제거)
-        pass
+        ctk.CTkLabel(
+            alloc_card,
+            text="종목을 추가하면 종목별, 섹터별, 국내·미국장 비율을 한눈에 보여드려요.",
+            font=(self.font_family, 12),
+            text_color="#8B95A1",
+            wraplength=560,
+            justify="left",
+        ).pack(anchor="w", padx=20, pady=(0, 8))
 
         self._alloc_chart_frame = ctk.CTkFrame(alloc_card, fg_color="transparent")
         self._alloc_chart_frame.pack(fill="x", padx=10, pady=(0, 12))
@@ -287,48 +751,61 @@ class GTDApp:
                      font=(self.font_family, 13), text_color="#8B95A1").pack(pady=20)
 
         # ── 메인 2열 분할 ───────────────────────────────────────────────
+        compact_dashboard = self._use_compact_dashboard()
         main_split = ctk.CTkFrame(dash_scroll, fg_color="transparent")
         main_split.pack(fill="both", expand=True, padx=30, pady=(0, 20))
-        main_split.columnconfigure(0, weight=5)
-        main_split.columnconfigure(1, weight=5)
+        if not compact_dashboard:
+            main_split.columnconfigure(0, weight=5)
+            main_split.columnconfigure(1, weight=5)
 
         left_col = ctk.CTkFrame(main_split, fg_color="transparent")
-        left_col.grid(row=0, column=0, padx=(0, 10), sticky="nsew")
+        right_col = ctk.CTkFrame(main_split, fg_color="transparent")
+
+        if compact_dashboard:
+            right_col.pack(fill="x", pady=(0, 10))
+            left_col.pack(fill="x")
+            card_fill = "x"
+            card_expand = False
+        else:
+            left_col.grid(row=0, column=0, padx=(0, 10), sticky="nsew")
+            right_col.grid(row=0, column=1, padx=(10, 0), sticky="nsew")
+            card_fill = "both"
+            card_expand = True
 
         self.invest_card = ctk.CTkFrame(left_col, fg_color="#FFFFFF",
                                          border_width=1, border_color="#E5E8EB", corner_radius=20)
-        self.invest_card.pack(fill="both", expand=True, pady=(0, 10))
-        ctk.CTkLabel(self.invest_card, text="나의 투자 종목",
-                     font=(self.font_family, 18, "bold"), text_color="#191F28").pack(anchor="w", padx=20, pady=(20, 10))
+        self.invest_card.pack(fill=card_fill, expand=card_expand, pady=(0, 10))
+        self._render_card_header(self.invest_card, "내가 산 종목", "평단가와 현재가 차이를 확인해요")
         self.invest_scroll = ctk.CTkScrollableFrame(self.invest_card, fg_color="transparent")
         self.invest_scroll.pack(fill="both", expand=True, padx=10, pady=(0, 15))
 
         self.watch_card = ctk.CTkFrame(left_col, fg_color="#FFFFFF",
                                         border_width=1, border_color="#E5E8EB", corner_radius=20)
-        self.watch_card.pack(fill="both", expand=True, pady=(10, 0))
-        ctk.CTkLabel(self.watch_card, text="나의 관심 종목",
-                     font=(self.font_family, 18, "bold"), text_color="#191F28").pack(anchor="w", padx=20, pady=(20, 10))
+        self.watch_card.pack(fill=card_fill, expand=card_expand, pady=(10, 0))
+        self._render_card_header(self.watch_card, "지켜볼 종목", "아직 사지 않았지만 보고 싶은 종목")
         self.watch_scroll = ctk.CTkScrollableFrame(self.watch_card, fg_color="transparent")
         self.watch_scroll.pack(fill="both", expand=True, padx=10, pady=(0, 15))
 
-        right_col = ctk.CTkFrame(main_split, fg_color="transparent")
-        right_col.grid(row=0, column=1, padx=(10, 0), sticky="nsew")
-
         self.news_card = ctk.CTkFrame(right_col, fg_color="#FFFFFF",
                                        border_width=1, border_color="#E5E8EB", corner_radius=20)
-        self.news_card.pack(fill="both", expand=True, pady=(0, 10))
-        ctk.CTkLabel(self.news_card, text="오늘의 대형 증시 뉴스",
-                     font=(self.font_family, 18, "bold"), text_color="#191F28").pack(anchor="w", padx=20, pady=(20, 5))
-        ctk.CTkLabel(self.news_card, text="00시 기준 하루 1회 업데이트",
-                     font=(self.font_family, 12), text_color="#8B95A1").pack(anchor="w", padx=20, pady=(0, 10))
+        self.news_card.pack(fill=card_fill, expand=card_expand, pady=(0, 10))
+        self._render_card_header(
+            self.news_card,
+            "24시간 주요 뉴스",
+            "제목이나 기사 버튼을 누르면 원문을 열고, 분석 버튼으로 쉬운 해설을 볼 수 있어요.",
+        )
         self.news_scroll = ctk.CTkFrame(self.news_card, fg_color="transparent")
         self.news_scroll.pack(fill="both", expand=True, padx=15, pady=(0, 15))
 
         self.sector_card = ctk.CTkFrame(right_col, fg_color="#FFFFFF",
                                          border_width=1, border_color="#E5E8EB", corner_radius=20)
-        self.sector_card.pack(fill="both", expand=True, pady=(10, 0))
-        ctk.CTkLabel(self.sector_card, text="이번 주 주목받는 섹터 레이더",
-                     font=(self.font_family, 18, "bold"), text_color="#3182F6").pack(anchor="w", padx=20, pady=(20, 5))
+        self.sector_card.pack(fill=card_fill, expand=card_expand, pady=(10, 0))
+        self._render_card_header(
+            self.sector_card,
+            "이번 주 눈여겨볼 섹터",
+            "왜 주목받는지와 함께 관련 종목을 같이 보여드려요.",
+            title_color="#3182F6",
+        )
         self.sector_title_lbl = ctk.CTkLabel(self.sector_card, text="집계 중...",
                                               font=(self.font_family, 16, "bold"), text_color="#191F28")
         self.sector_title_lbl.pack(anchor="w", padx=20)
@@ -343,8 +820,8 @@ class GTDApp:
 
     def _return_banner_loading(self):
         for w in self.return_banner.winfo_children(): w.destroy()
-        ctk.CTkLabel(self.return_banner, text="수익률 계산 중...",
-                     font=(self.font_family, 13), text_color="#8B95A1").pack(pady=18)
+        ctk.CTkLabel(self.return_banner, text="내 종목 수익률을 계산 중입니다.",
+                     font=(self.font_family, 13), text_color="#8B95A1").pack(anchor="w", padx=24, pady=18)
 
     def _render_return_banner(self, invest_df):
         """투자 종목 기준 총 수익률 배너 렌더링 (비동기 결과 수신 후 호출)"""
@@ -374,15 +851,21 @@ class GTDApp:
             total_val  += val
 
         if not rows_data or total_cost == 0:
+            empty_text = "투자 종목을 추가하면 수익률을 보여드려요."
+            if not invest_df.empty:
+                empty_text = "현재가를 불러오는 중입니다. 잠시 후 새로고침해 주세요."
             ctk.CTkLabel(self.return_banner,
-                         text="투자 종목의 현재가 수집 중... 잠시 후 새로고침 해주세요.",
-                         font=(self.font_family, 13), text_color="#8B95A1").pack(pady=18)
+                         text=empty_text,
+                         font=(self.font_family, 13),
+                         text_color="#8B95A1",
+                         wraplength=480,
+                         justify="left").pack(anchor="w", padx=24, pady=18)
             return
 
         total_yield = (total_val - total_cost) / total_cost * 100
         profit      = total_val - total_cost
         is_profit   = total_yield >= 0
-        accent      = "#3182F6" if is_profit else "#F04452"
+        accent      = "#F04452" if is_profit else "#3182F6"
         sign        = "+" if is_profit else ""
 
         row_frame = ctk.CTkFrame(self.return_banner, fg_color="transparent")
@@ -391,7 +874,7 @@ class GTDApp:
         # 왼쪽: 총 평가 정보
         left = ctk.CTkFrame(row_frame, fg_color="transparent")
         left.pack(side="left", fill="x", expand=True)
-        ctk.CTkLabel(left, text="총 투자 수익률 (투자 종목 기준)",
+        ctk.CTkLabel(left, text="내 투자 상태",
                      font=(self.font_family, 12), text_color="#8B95A1").pack(anchor="w")
         ctk.CTkLabel(left, text=f"{sign}{total_yield:.2f}%",
                      font=(self.font_family, 28, "bold"), text_color=accent).pack(anchor="w")
@@ -399,18 +882,18 @@ class GTDApp:
         currency = "원" if is_kr else "$"
         ctk.CTkLabel(left,
                      text=f"투자 원금 {total_cost:,.0f}{currency}  →  평가금액 {total_val:,.0f}{currency}  ({sign}{profit:,.0f}{currency})",
-                     font=(self.font_family, 12), text_color="#A8B4C8").pack(anchor="w")
+                     font=(self.font_family, 12), text_color="#4E5968").pack(anchor="w")
 
         # 오른쪽: 종목별 미니 수익률
         right = ctk.CTkFrame(row_frame, fg_color="transparent")
         right.pack(side="right")
         for name, sym, cost, val, bp, cp, bq in rows_data[:4]:
             yld = (val - cost) / cost * 100 if cost > 0 else 0
-            yld_col = "#3182F6" if yld >= 0 else "#F04452"
-            item = ctk.CTkFrame(right, fg_color="#252E45", corner_radius=10)
+            yld_col = "#F04452" if yld >= 0 else "#3182F6"
+            item = ctk.CTkFrame(right, fg_color="#F2F4F6", corner_radius=10)
             item.pack(side="left", padx=4)
             ctk.CTkLabel(item, text=name[:6], font=(self.font_family, 10),
-                         text_color="#A8B4C8").pack(padx=10, pady=(6, 0))
+                         text_color="#8B95A1").pack(padx=10, pady=(6, 0))
             ctk.CTkLabel(item, text=f"{'+' if yld >= 0 else ''}{yld:.1f}%",
                          font=(self.font_family, 13, "bold"),
                          text_color=yld_col).pack(padx=10, pady=(0, 6))
@@ -476,8 +959,8 @@ class GTDApp:
 
         if not stock_vals:
             for w in self._alloc_chart_frame.winfo_children(): w.destroy()
-            ctk.CTkLabel(self._alloc_chart_frame, text="투자 종목을 추가하면 비율 차트가 표시됩니다.",
-                         font=(self.font_family, 13), text_color="#8B95A1").pack(pady=20)
+            ctk.CTkLabel(self._alloc_chart_frame, text="투자 종목을 추가하면 내 돈이 어디에 들어가 있는지 차트로 보여드려요.",
+                         font=(self.font_family, 13), text_color="#8B95A1").pack(anchor="w", padx=20, pady=20)
             return
 
         # ── matplotlib 3-도넛 차트 ───────────────────────────────────────
@@ -486,8 +969,17 @@ class GTDApp:
         import matplotlib.pyplot as plt
         import matplotlib.font_manager as fm
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-        # 한글 폰트 설정 (Windows: 맑은 고딕)
-        _kr_fonts = ["Malgun Gothic", "Apple Gothic", "NanumGothic", "Gulim"]
+        # 한글 폰트 설정
+        _kr_fonts = [
+            "Toss Moneygraphy",
+            "TossMoneygraphy",
+            "토스 머니그라피",
+            "Pretendard",
+            "Malgun Gothic",
+            "Apple Gothic",
+            "NanumGothic",
+            "Gulim",
+        ]
         for _f in _kr_fonts:
             if any(_f.lower() in f.name.lower() for f in fm.fontManager.ttflist):
                 plt.rcParams["font.family"] = _f
@@ -555,7 +1047,13 @@ class GTDApp:
             for w in self.invest_scroll.winfo_children(): w.destroy()
             invest_df = user_df[user_df["type"] == "투자"]
             if invest_df.empty:
-                ctk.CTkLabel(self.invest_scroll, text="등록된 투자 자산이 없습니다.", font=(self.font_family, 14), text_color="#8B95A1").pack(pady=30)
+                ctk.CTkLabel(
+                    self.invest_scroll,
+                    text="아직 산 종목이 없어요.\n'나의 종목'에서 투자 종목을 추가해보세요.",
+                    font=(self.font_family, 14),
+                    text_color="#8B95A1",
+                    justify="center",
+                ).pack(pady=28)
             else:
                 for _, row in invest_df.iterrows():
                     self.create_dashboard_stock_item(self.invest_scroll, row)
@@ -564,34 +1062,76 @@ class GTDApp:
             for w in self.watch_scroll.winfo_children(): w.destroy()
             watch_df = user_df[user_df["type"] == "관심"]
             if watch_df.empty:
-                ctk.CTkLabel(self.watch_scroll, text="등록된 관심 자산이 없습니다.", font=(self.font_family, 14), text_color="#8B95A1").pack(pady=30)
+                ctk.CTkLabel(
+                    self.watch_scroll,
+                    text="지켜볼 종목을 추가하면\n가격 흐름을 여기서 바로 볼 수 있어요.",
+                    font=(self.font_family, 14),
+                    text_color="#8B95A1",
+                    justify="center",
+                ).pack(pady=28)
             else:
                 for _, row in watch_df.iterrows():
                     self.create_dashboard_stock_item(self.watch_scroll, row)
 
         if self.is_widget_alive("news_scroll"):
             for w in self.news_scroll.winfo_children(): w.destroy()
+            news_wrap = self._content_wraplength(max_width=760, min_width=360, reserve=390) if self._use_compact_dashboard() else 430
+            if not daily_news:
+                ctk.CTkLabel(
+                    self.news_scroll,
+                    text="최근 24시간 내 주요 증시 뉴스를 불러오지 못했습니다. 새로고침 후 다시 확인해 주세요.",
+                    font=(self.font_family, 13),
+                    text_color="#8B95A1",
+                    wraplength=news_wrap,
+                    justify="left",
+                ).pack(anchor="w", padx=8, pady=18)
+                daily_news = []
+
             for news in daily_news[:3]:
                 news_item = ctk.CTkFrame(self.news_scroll, fg_color="#F2F4F6",
-                                          height=68, corner_radius=12, cursor="hand2")
-                news_item.pack(fill="x", pady=4)
+                                          height=140, corner_radius=12, cursor="hand2")
+                news_item.pack(fill="x", pady=5)
                 news_item.pack_propagate(False)
 
                 symbol = news.get("symbol", "GENERIC")
                 logo_lbl = ctk.CTkLabel(news_item, text="", image=self.make_placeholder_logo(symbol))
-                logo_lbl.pack(side="left", padx=(10, 5))
+                logo_lbl.pack(side="left", padx=(12, 7))
                 self.load_logo_to_label_async(symbol, logo_lbl)
 
                 sentiment = news.get("sentiment", "복합")
                 tag_bg = "#2ECC71" if sentiment == "호재" else "#F04452" if sentiment == "악재" else "#8B95A1"
                 tag_lbl = ctk.CTkLabel(news_item, text=f" {sentiment} ", font=(self.font_family, 11, "bold"), text_color="#FFFFFF", fg_color=tag_bg, corner_radius=6, height=22)
-                tag_lbl.pack(side="left", padx=5)
+                tag_lbl.pack(side="left", padx=(0, 10))
 
-                title_lbl = ctk.CTkLabel(news_item, text=news["title"],
-                                          font=(self.font_family, 12, "bold"),
-                                          text_color="#191F28", anchor="w",
-                                          wraplength=320, justify="left")
-                title_lbl.pack(side="left", fill="x", expand=True, padx=5)
+                text_panel = ctk.CTkFrame(news_item, fg_color="transparent")
+                text_panel.pack(side="left", fill="both", expand=True, pady=(10, 8))
+
+                title_lbl = ctk.CTkLabel(
+                    text_panel,
+                    text=news["title"],
+                    font=(self.font_family, 12, "bold"),
+                    text_color="#0B63CE",
+                    anchor="w",
+                    wraplength=news_wrap,
+                    justify="left",
+                )
+                title_lbl.pack(anchor="w", fill="x")
+
+                meta_text = news.get("age_label", "최근 24시간")
+                if news.get("sentiment_reason"):
+                    meta_text = f"{meta_text} · {news['sentiment_reason']}"
+                ctk.CTkLabel(
+                    text_panel,
+                    text=meta_text,
+                    font=(self.font_family, 11),
+                    text_color="#8B95A1",
+                    anchor="w",
+                    wraplength=news_wrap,
+                    justify="left",
+                ).pack(anchor="w", fill="x", pady=(4, 0))
+
+                action_panel = ctk.CTkFrame(text_panel, fg_color="transparent")
+                action_panel.pack(anchor="w", pady=(6, 0))
 
                 def make_on_enter(ni):
                     return lambda e: ni.configure(fg_color="#E8F3FF")
@@ -601,15 +1141,52 @@ class GTDApp:
                 link = news.get("link")
                 news_title_full = news["title"]
                 news_sentiment  = sentiment
+                news_reason = news.get("sentiment_reason", "")
 
-                def make_click_handler(ln, title, sent):
-                    def handler(e):
-                        self._show_news_ai_popup(title, sent)
+                def make_open_handler(ln):
+                    def handler(e=None):
+                        self._open_url(ln)
                     return handler
 
-                click_func = make_click_handler(link, news_title_full, news_sentiment)
-                for widget in (news_item, logo_lbl, tag_lbl, title_lbl):
-                    widget.bind("<Button-1>", click_func)
+                def make_analysis_handler(title, sent, reason, ln):
+                    def handler(e=None):
+                        self._show_news_ai_popup(title, sent, reason, ln)
+                    return handler
+
+                open_func = make_open_handler(link)
+                analysis_func = make_analysis_handler(news_title_full, news_sentiment, news_reason, link)
+
+                ctk.CTkButton(
+                    action_panel,
+                    text="분석",
+                    width=58,
+                    height=28,
+                    font=(self.font_family, 11, "bold"),
+                    fg_color="#FFFFFF",
+                    text_color="#4E5968",
+                    hover_color="#E5E8EB",
+                    corner_radius=7,
+                    command=analysis_func,
+                ).pack(side="left")
+                ctk.CTkButton(
+                    action_panel,
+                    text="기사",
+                    width=58,
+                    height=28,
+                    font=(self.font_family, 11, "bold"),
+                    fg_color="#3182F6",
+                    text_color="#FFFFFF",
+                    hover_color="#1B64DA",
+                    corner_radius=7,
+                    command=open_func,
+                ).pack(side="left", padx=(6, 0))
+
+                for widget in (news_item, logo_lbl, title_lbl):
+                    widget.bind("<Button-1>", open_func)
+                    widget.bind("<Enter>", make_on_enter(news_item))
+                    widget.bind("<Leave>", make_on_leave(news_item))
+                for widget in (tag_lbl,):
+                    widget.bind("<Button-1>", analysis_func)
                     widget.bind("<Enter>", make_on_enter(news_item))
                     widget.bind("<Leave>", make_on_leave(news_item))
 
@@ -639,7 +1216,7 @@ class GTDApp:
                 text_panel.pack(side="left", fill="x", expand=True)
 
                 ctk.CTkLabel(text_panel, text=comp["name"], font=(self.font_family, 13, "bold"), text_color="#191F28", anchor="w").pack(anchor="w")
-                
+
                 p_lbl = ctk.CTkLabel(text_panel, text="로딩 중...", font=(self.font_family, 11), text_color="#8B95A1", anchor="w")
                 p_lbl.pack(anchor="w")
 
@@ -733,8 +1310,11 @@ class GTDApp:
         """나의 투자/관심 종목 개별 카드 생성 (요구사항 2)"""
         full_name = stock_row["stock_name"]
         symbol = full_name.split("(")[-1].replace(")", "").strip() if "(" in full_name else full_name
-        
-        card = ctk.CTkFrame(parent_scroll, fg_color="#F2F4F6", height=60, corner_radius=12, cursor="hand2")
+        display_name = full_name.split(" (")[0]
+        if len(display_name) > 18:
+            display_name = display_name[:17] + "..."
+
+        card = ctk.CTkFrame(parent_scroll, fg_color="#F2F4F6", height=68, corner_radius=12, cursor="hand2")
         card.pack(fill="x", pady=4, padx=5)
         card.pack_propagate(False)
 
@@ -742,12 +1322,16 @@ class GTDApp:
         logo_lbl.pack(side="left", padx=12)
         self.load_logo_to_label_async(symbol, logo_lbl)
 
-        name_lbl = ctk.CTkLabel(card, text=full_name.split(" (")[0], font=(self.font_family, 15, "bold"), text_color="#191F28", anchor="w")
-        name_lbl.pack(side="left", fill="x", expand=True, padx=5)
+        name_box = ctk.CTkFrame(card, fg_color="transparent")
+        name_box.pack(side="left", fill="x", expand=True, padx=5, pady=10)
+        name_lbl = ctk.CTkLabel(name_box, text=display_name, font=(self.font_family, 15, "bold"), text_color="#191F28", anchor="w")
+        name_lbl.pack(anchor="w", fill="x")
+        symbol_lbl = ctk.CTkLabel(name_box, text=symbol, font=(self.font_family, 11), text_color="#8B95A1", anchor="w")
+        symbol_lbl.pack(anchor="w", fill="x")
 
         price_frame = ctk.CTkFrame(card, fg_color="transparent")
         price_frame.pack(side="right", padx=15)
-        
+
         p_lbl = ctk.CTkLabel(price_frame, text="연동 중...", font=(self.font_family, 14, "bold"), text_color="#8B95A1", anchor="e")
         p_lbl.pack(anchor="e")
         r_lbl = ctk.CTkLabel(price_frame, text="--%", font=(self.font_family, 12), text_color="#8B95A1", anchor="e")
@@ -763,7 +1347,7 @@ class GTDApp:
             self.switch_tab("portfolio")
             self.on_stock_item_clicked(r, s)
 
-        for widget in (card, logo_lbl, name_lbl, price_frame, p_lbl, r_lbl):
+        for widget in (card, logo_lbl, name_box, name_lbl, symbol_lbl, price_frame, p_lbl, r_lbl):
             widget.bind("<Button-1>", on_click)
             widget.bind("<Button-3>", lambda e, target=full_name: self.delete_stock_from_db_and_refresh(target))
 
@@ -774,70 +1358,54 @@ class GTDApp:
         self.render_dashboard_tab()
 
     def get_daily_cached_news(self):
-        """오늘의 대형 뉴스 3가지 연동"""
-        today_str = datetime.date.today().strftime("%Y-%m-%d")
-        if self.daily_news_cache and self.daily_news_cache_date == today_str:
+        """최근 24시간 이내의 대형 증시 뉴스 3가지 연동"""
+        now = datetime.datetime.now()
+        today_str = now.strftime("%Y-%m-%d")
+        if (
+            self.daily_news_cache
+            and self.daily_news_cache_time
+            and now - self.daily_news_cache_time < datetime.timedelta(minutes=30)
+        ):
             return self.daily_news_cache
-            
+
         news_list = []
+        seen_titles = set()
         try:
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            }
-            url = "https://search.naver.com/search.naver?where=news&query=" + urllib.parse.quote("증시 대형 호재 악재")
-            res = requests.get(url, headers=headers, timeout=3)
-            if res.status_code == 200:
-                soup = BeautifulSoup(res.text, 'html.parser')
-                # news_tit 클래스로 실제 기사 제목+URL 직접 추출
-                for a in soup.find_all('a', class_='news_tit'):
-                    title = a.get_text().strip()
-                    href  = a.get('href', '')
-                    if not href.startswith('http') or len(title) < 15: continue
-
-                    sentiment = "복합"
-                    pos_words = ["상승", "호재", "방한", "합의", "상향", "순항", "돌파", "최고", "성장", "증가", "유치", "급등", "체결"]
-                    neg_words = ["하락", "악재", "우려", "부진", "감소", "적자", "쇼크", "급락", "손실", "악화", "갈등", "규제"]
-                    if any(pw in title for pw in pos_words): sentiment = "호재"
-                    elif any(nw in title for nw in neg_words): sentiment = "악재"
-
-                    symbol = "GENERIC"
-                    if "삼성" in title: symbol = "005930.KS"
-                    elif "SK" in title or "하이닉스" in title: symbol = "000660.KS"
-                    elif "엔비디아" in title or "젠슨황" in title: symbol = "NVDA"
-                    elif "마이크론" in title: symbol = "MU"
-                    elif "테슬라" in title: symbol = "TSLA"
-                    elif "애플" in title: symbol = "AAPL"
-
-                    news_list.append({"title": title, "symbol": symbol, "sentiment": sentiment, "link": href})
-                    if len(news_list) >= 3:
-                        break
+            queries = [
+                "증시 주요 뉴스",
+                "코스피 나스닥 증시",
+                "주식시장 호재 악재",
+            ]
+            for query in queries:
+                if len(news_list) >= 3:
+                    break
+                needed = 3 - len(news_list)
+                news_list.extend(self._fetch_recent_naver_news(query, limit=needed, seen_titles=seen_titles))
         except Exception as e:
             print(f"[디버깅] 뉴스 연동 오류: {e}")
 
-        if len(news_list) < 3:
-            fallback_titles = [
-                ("젠슨황 방한 소식에 국내 AI 반도체 기판 공급망 업계 기대감 급증", "NVDA", "호재"),
-                ("마이크론 4분기 목표 주가 대폭 상향으로 메모리 섹터 활기", "MU", "호재"),
-                ("글로벌 거시 경제 갈등 우려 지속으로 증시 변동성 확대", "GENERIC", "악재"),
-            ]
-            for title, sym, sent in fallback_titles:
-                if len(news_list) >= 3: break
-                news_list.append({
-                    "title": title,
-                    "symbol": sym,
-                    "sentiment": sent,
-                    "link": "https://search.naver.com/search.naver?where=news&query=" + urllib.parse.quote(title)
-                })
+        if not news_list:
+            news_list.append({
+                "title": "최근 24시간 주요 증시 뉴스를 불러오지 못했습니다. 최신 검색 결과 열기",
+                "symbol": "GENERIC",
+                "sentiment": "복합",
+                "sentiment_reason": "네이버 최신순 검색 링크",
+                "link": self._build_naver_news_url("증시 주요 뉴스"),
+                "age_label": "실시간 검색",
+                "published_at": "",
+                "is_notice": True,
+            })
 
         self.daily_news_cache = news_list
         self.daily_news_cache_date = today_str
+        self.daily_news_cache_time = now
         return news_list
 
-    def _show_news_ai_popup(self, news_title, sentiment):
+    def _show_news_ai_popup(self, news_title, sentiment, sentiment_reason="", link=None):
         """뉴스 악재/호재 클릭 시 AI 분석 팝업"""
         popup = ctk.CTkToplevel(self.root)
         popup.title("AI 뉴스 분석")
-        popup.geometry("520x420")
+        popup.geometry("620x520")
         popup.grab_set()
         popup.resizable(False, False)
 
@@ -850,19 +1418,33 @@ class GTDApp:
         ctk.CTkLabel(hdr, text=f"{sent_emoji}  왜 {sentiment}일까?",
                      font=(self.font_family, 17, "bold"), text_color="#FFFFFF").pack(side="left", padx=20, pady=16)
 
-        ctk.CTkLabel(popup, text=news_title[:60] + ("..." if len(news_title) > 60 else ""),
-                     font=(self.font_family, 12), text_color="#4E5968",
-                     wraplength=480, justify="left").pack(anchor="w", padx=20, pady=(12, 4))
+        ctk.CTkLabel(popup, text=news_title,
+                     font=(self.font_family, 13, "bold"), text_color="#191F28",
+                     wraplength=570, justify="left").pack(anchor="w", padx=20, pady=(14, 4))
+        if sentiment_reason:
+            ctk.CTkLabel(popup, text=f"분류 근거: {sentiment_reason}",
+                         font=(self.font_family, 12), text_color="#8B95A1",
+                         wraplength=570, justify="left").pack(anchor="w", padx=20, pady=(0, 4))
 
-        result_box = ctk.CTkTextbox(popup, height=220, font=(self.font_family, 13),
+        result_box = ctk.CTkTextbox(popup, height=285, font=(self.font_family, 13),
                                      fg_color="#F7F8FA", border_width=0, corner_radius=10, wrap="word")
         result_box.pack(fill="x", padx=20, pady=8)
-        result_box.insert("1.0", "AI가 분석 중입니다...")
+        result_box.insert(
+            "1.0",
+            "기본 분석을 먼저 표시합니다. AI 상세 분석을 불러오는 중입니다...\n\n"
+            + self._build_local_news_analysis(news_title, sentiment, sentiment_reason)
+        )
         result_box.configure(state="disabled")
 
-        ctk.CTkButton(popup, text="닫기", height=36, font=(self.font_family, 13, "bold"),
+        btn_row = ctk.CTkFrame(popup, fg_color="transparent")
+        btn_row.pack(fill="x", padx=20, pady=(0, 16))
+        if link:
+            ctk.CTkButton(btn_row, text="기사 열기", height=36, font=(self.font_family, 13, "bold"),
+                          fg_color="#3182F6", hover_color="#1B64DA",
+                          corner_radius=8, command=lambda: self._open_url(link)).pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ctk.CTkButton(btn_row, text="닫기", height=36, font=(self.font_family, 13, "bold"),
                       fg_color="#E5E8EB", text_color="#191F28", hover_color="#D0D4DA",
-                      corner_radius=8, command=popup.destroy).pack(pady=(0, 16))
+                      corner_radius=8, command=popup.destroy).pack(side="left", fill="x", expand=True, padx=(6, 0))
 
         def call_ai():
             try:
@@ -872,6 +1454,7 @@ class GTDApp:
                     prompt = f"""다음 주식 뉴스가 왜 호재(좋은 소식)인지 초보 투자자도 이해할 수 있게 설명해주세요.
 
 뉴스 제목: {news_title}
+분류 근거: {sentiment_reason}
 
 다음 형식으로 한국어로 간결하게 답변해주세요:
 
@@ -883,10 +1466,11 @@ class GTDApp:
 
 [주의할 점]
 호재에도 불구하고 주의할 리스크 1가지"""
-                else:
+                elif sentiment == "악재":
                     prompt = f"""다음 주식 뉴스가 왜 악재(나쁜 소식)인지 초보 투자자도 이해할 수 있게 설명해주세요.
 
 뉴스 제목: {news_title}
+분류 근거: {sentiment_reason}
 
 다음 형식으로 한국어로 간결하게 답변해주세요:
 
@@ -898,6 +1482,22 @@ class GTDApp:
 
 [대응 방법]
 이런 악재 상황에서 투자자가 취할 수 있는 행동 1가지"""
+                else:
+                    prompt = f"""다음 주식 뉴스가 호재와 악재가 섞인 복합 이슈인지 초보 투자자도 이해할 수 있게 설명해주세요.
+
+뉴스 제목: {news_title}
+분류 근거: {sentiment_reason}
+
+다음 형식으로 한국어로 간결하게 답변해주세요:
+
+[핵심 이유]
+긍정 요인과 부정 요인을 각각 1~2문장
+
+[주식시장에 미치는 영향]
+어떤 종목/섹터에 어떤 영향을 미칠 수 있는지
+
+[확인할 점]
+투자자가 추가로 확인해야 할 지표나 뉴스 1가지"""
 
                 response = client.models.generate_content(
                     model="gemini-2.5-flash", contents=prompt)
@@ -915,9 +1515,10 @@ class GTDApp:
                 def show_err():
                     try:
                         if popup.winfo_exists():
+                            fallback = self._build_local_news_analysis(news_title, sentiment, sentiment_reason)
                             result_box.configure(state="normal")
                             result_box.delete("1.0", "end")
-                            result_box.insert("1.0", f"AI 연결 실패: {e}")
+                            result_box.insert("1.0", f"AI 연결 실패로 기본 분석을 표시합니다.\n{e}\n\n{fallback}")
                             result_box.configure(state="disabled")
                     except Exception: pass
                 self.root.after(0, show_err)
@@ -980,40 +1581,40 @@ class GTDApp:
         """포트폴리오 관리 탭"""
         self.portfolio_split = ctk.CTkFrame(self.content_area, fg_color="transparent")
         self.portfolio_split.pack(fill="both", expand=True, padx=30, pady=20)
-        
+
         self.port_left = ctk.CTkFrame(self.portfolio_split, fg_color="#FFFFFF", border_width=1, border_color="#E5E8EB", corner_radius=20, width=440)
         self.port_left.pack(side="left", fill="both", padx=(0, 10))
         self.port_left.pack_propagate(False)
-        
+
         self.port_right = ctk.CTkFrame(self.portfolio_split, fg_color="#FFFFFF", border_width=1, border_color="#E5E8EB", corner_radius=20)
         self.port_right.pack(side="right", fill="both", expand=True, padx=(10, 0))
-        
+
         left_header = ctk.CTkFrame(self.port_left, fg_color="transparent")
         left_header.pack(fill="x", padx=25, pady=(25, 6))
-        
+
         ctk.CTkLabel(left_header, text="나의 종목", font=(self.font_family, 22, "bold"), text_color="#191F28").pack(side="left")
         ctk.CTkButton(left_header, text="새로고침", width=80, height=32, font=(self.font_family, 13, "bold"), fg_color="#E8F3FF", text_color="#3182F6", hover_color="#D0E6FF", corner_radius=8, command=self.refresh_stock_list).pack(side="right")
         ctk.CTkButton(left_header, text="종목 검색 추가", width=110, height=32, font=(self.font_family, 13, "bold"), fg_color="#3182F6", text_color="#FFFFFF", hover_color="#1B64DA", corner_radius=8, command=self.show_search_add_modal).pack(side="right", padx=(0, 8))
-        
+
         ctk.CTkLabel(self.port_left, text="종목 클릭 시 상세보고서, 우클릭 시 삭제", font=(self.font_family, 13), text_color="#8B95A1").pack(anchor="w", padx=25, pady=(0, 15))
-        
+
         self.stock_list_scroll = ctk.CTkScrollableFrame(self.port_left, fg_color="transparent")
         self.stock_list_scroll.pack(fill="both", expand=True, padx=15, pady=5)
-        
+
         add_frame = ctk.CTkFrame(self.port_left, fg_color="#F2F4F6", corner_radius=16)
         add_frame.pack(fill="x", padx=20, pady=20)
         add_frame.columnconfigure((0, 1), weight=1)
-        
+
         self.add_name = ctk.CTkEntry(add_frame, placeholder_text="종목명 입력 (예: 삼성전자, 테슬라, AAPL)", height=45, font=(self.font_family, 15), fg_color="#FFFFFF", border_width=1, border_color="#E5E8EB", corner_radius=10)
         self.add_name.grid(row=0, column=0, columnspan=2, padx=12, pady=(12, 6), sticky="ew")
         self.add_name.bind("<KeyRelease>", self.on_search_typing_debounce)
-        
+
         self.add_price = ctk.CTkEntry(add_frame, placeholder_text="평단가", height=45, font=(self.font_family, 15), fg_color="#FFFFFF", border_width=1, border_color="#E5E8EB", corner_radius=10)
         self.add_price.grid(row=1, column=0, padx=(12, 6), pady=6, sticky="ew")
-        
+
         self.add_qty = ctk.CTkEntry(add_frame, placeholder_text="보유량", height=45, font=(self.font_family, 15), fg_color="#FFFFFF", border_width=1, border_color="#E5E8EB", corner_radius=10)
         self.add_qty.grid(row=1, column=1, padx=(6, 12), pady=6, sticky="ew")
-        
+
         ctk.CTkButton(add_frame, text="투자 추가", height=40, font=(self.font_family, 14, "bold"), fg_color="#3182F6", hover_color="#1B64DA", corner_radius=10, command=lambda: self.add_stock_to_db("투자")).grid(row=2, column=0, padx=(12, 6), pady=(6, 6), sticky="ew")
         ctk.CTkButton(add_frame, text="관심 추가", height=40, font=(self.font_family, 14, "bold"), fg_color="#E8F3FF", text_color="#3182F6", hover_color="#D0E6FF", corner_radius=10, command=lambda: self.add_stock_to_db("관심")).grid(row=2, column=1, padx=(6, 12), pady=(6, 6), sticky="ew")
 
@@ -1042,7 +1643,7 @@ class GTDApp:
         modal.grab_set()
         modal.resizable(False, False)
         modal.configure(fg_color="#FFFFFF")
-        
+
         # 부모 창 중앙에 배치
         self.root.update_idletasks()
         rx = self.root.winfo_x()
@@ -1052,30 +1653,30 @@ class GTDApp:
         mx = rx + (rw // 2) - (520 // 2)
         my = ry + (rh // 2) - (450 // 2)
         modal.geometry(f"520x450+{mx}+{my}")
-        
+
         # 타이틀 영역
         ctk.CTkLabel(modal, text="종목 검색 및 추가", font=(self.font_family, 20, "bold"), text_color="#191F28").pack(pady=(20, 5))
         ctk.CTkLabel(modal, text="국내 주식명/코드 또는 해외 티커(AAPL, TSLA 등)를 검색하세요.", font=(self.font_family, 13), text_color="#8B95A1").pack(pady=(0, 15))
-        
+
         # 검색 필드
         search_frame = ctk.CTkFrame(modal, fg_color="transparent")
         search_frame.pack(fill="x", padx=30, pady=5)
-        
+
         entry = ctk.CTkEntry(search_frame, placeholder_text="검색어를 입력해 주세요 (예: 삼성전자, 애플)", height=45, font=(self.font_family, 14), fg_color="#F2F4F6", border_width=1, border_color="#E5E8EB", corner_radius=10)
         entry.pack(fill="x", expand=True)
         entry.focus()
-        
+
         # 결과 표시 스크롤 박스
         results_scroll = ctk.CTkScrollableFrame(modal, fg_color="#F9FAFB", height=240, corner_radius=12, border_color="#E5E8EB", border_width=1)
         results_scroll.pack(fill="both", expand=True, padx=30, pady=(15, 20))
-        
+
         # 안내 문구 기본 노출
         info_lbl = ctk.CTkLabel(results_scroll, text="검색어를 입력하시면 추천 리스트가 나타납니다.", font=(self.font_family, 13), text_color="#8B95A1")
         info_lbl.pack(pady=40)
-        
+
         # 디바운스 검색 구현
         modal._search_timer = None
-        
+
         def on_typing(event):
             query = entry.get().strip()
             if not query:
@@ -1083,21 +1684,21 @@ class GTDApp:
                 lbl = ctk.CTkLabel(results_scroll, text="검색어를 입력하시면 추천 리스트가 나타납니다.", font=(self.font_family, 13), text_color="#8B95A1")
                 lbl.pack(pady=40)
                 return
-            
+
             if modal._search_timer:
                 modal.after_cancel(modal._search_timer)
             modal._search_timer = modal.after(300, lambda: threading.Thread(target=search_worker, args=(query,), daemon=True).start())
-            
+
         def search_worker(query):
             results = self.search_autocomplete_tickers(query)
             modal.after(0, lambda: update_results_ui(results))
-            
+
         def update_results_ui(results):
             for w in results_scroll.winfo_children(): w.destroy()
             if not results:
                 ctk.CTkLabel(results_scroll, text="검색 결과가 없습니다.", font=(self.font_family, 13), text_color="#8B95A1").pack(pady=40)
                 return
-                
+
             for item in results:
                 row = ctk.CTkFrame(results_scroll, fg_color="#FFFFFF", height=58, corner_radius=10, cursor="hand2")
                 row.pack(fill="x", pady=4, padx=2)
@@ -1107,37 +1708,37 @@ class GTDApp:
                 logo_lbl = ctk.CTkLabel(row, text="", image=self.make_placeholder_logo(item['symbol'], size=38))
                 logo_lbl.pack(side="left", padx=(12, 6))
                 self.load_logo_to_label_async(item['symbol'], logo_lbl, size=38)
-                
+
                 # 마우스 호버 바인딩
                 def on_enter(e, r=row): r.configure(fg_color="#F2F4F6")
                 def on_leave(e, r=row): r.configure(fg_color="#FFFFFF")
-                
+
                 # 종목명 + 코드 표시
                 text_box = ctk.CTkFrame(row, fg_color="transparent")
                 text_box.pack(side="left", fill="x", expand=True, padx=4)
                 ctk.CTkLabel(text_box, text=item['name'], font=(self.font_family, 13, "bold"), text_color="#191F28", anchor="w").pack(anchor="w")
                 ctk.CTkLabel(text_box, text=item['symbol'], font=(self.font_family, 11), text_color="#8B95A1", anchor="w").pack(anchor="w")
-                
+
                 for widget in (row, logo_lbl, text_box):
                     widget.bind("<Enter>", on_enter)
                     widget.bind("<Leave>", on_leave)
-                
+
                 # 버튼 컨테이너 (우측 정렬)
                 btn_area = ctk.CTkFrame(row, fg_color="transparent")
                 btn_area.pack(side="right", padx=10)
-                
+
                 def make_add_action(stock_name=item['name'], stock_symbol=item['symbol']):
                     return lambda: ask_invest_details(stock_name, stock_symbol)
-                    
+
                 def make_watch_action(stock_name=item['name'], stock_symbol=item['symbol']):
                     return lambda: self.add_stock_from_modal(stock_name, stock_symbol, "관심", "0", "0", modal)
-                
+
                 btn_invest = ctk.CTkButton(btn_area, text="투자", width=52, height=30, font=(self.font_family, 11, "bold"), fg_color="#3182F6", hover_color="#1B64DA", corner_radius=8, command=make_add_action())
                 btn_invest.pack(side="left", padx=2)
-                
+
                 btn_watch = ctk.CTkButton(btn_area, text="관심", width=52, height=30, font=(self.font_family, 11, "bold"), fg_color="#E8F3FF", text_color="#3182F6", hover_color="#D0E6FF", corner_radius=8, command=make_watch_action())
                 btn_watch.pack(side="left", padx=2)
-                
+
         def ask_invest_details(name, symbol):
             dialog = ctk.CTkToplevel(modal)
             dialog.title("투자 평단가/수량 입력")
@@ -1146,7 +1747,7 @@ class GTDApp:
             dialog.grab_set()
             dialog.resizable(False, False)
             dialog.configure(fg_color="#FFFFFF")
-            
+
             modal.update_idletasks()
             px = modal.winfo_x()
             py = modal.winfo_y()
@@ -1155,19 +1756,19 @@ class GTDApp:
             dx = px + (pw // 2) - (360 // 2)
             dy = py + (ph // 2) - (240 // 2)
             dialog.geometry(f"360x240+{dx}+{dy}")
-            
+
             ctk.CTkLabel(dialog, text=f"{name} ({symbol})", font=(self.font_family, 15, "bold"), text_color="#191F28").pack(pady=(20, 10))
-            
+
             price_entry = ctk.CTkEntry(dialog, placeholder_text="매수 평단가 입력 (예: 75000)", height=38, font=(self.font_family, 13), fg_color="#F2F4F6", border_width=1, border_color="#E5E8EB", corner_radius=8)
             price_entry.pack(fill="x", padx=30, pady=4)
             price_entry.focus()
-            
+
             qty_entry = ctk.CTkEntry(dialog, placeholder_text="매수 수량 입력 (예: 10)", height=38, font=(self.font_family, 13), fg_color="#F2F4F6", border_width=1, border_color="#E5E8EB", corner_radius=8)
             qty_entry.pack(fill="x", padx=30, pady=4)
-            
+
             err_lbl = ctk.CTkLabel(dialog, text="", font=(self.font_family, 12, "bold"), text_color="#F04452")
             err_lbl.pack(pady=2)
-            
+
             def submit():
                 price = price_entry.get().strip()
                 qty = qty_entry.get().strip()
@@ -1180,13 +1781,13 @@ class GTDApp:
                 except ValueError:
                     err_lbl.configure(text="⚠️ 숫자 형식으로 입력해주세요.")
                     return
-                
+
                 success = self.add_stock_from_modal(name, symbol, "투자", price, qty, modal)
                 if success:
                     dialog.destroy()
-                    
+
             ctk.CTkButton(dialog, text="추가 완료", height=38, font=(self.font_family, 13, "bold"), fg_color="#3182F6", hover_color="#1B64DA", corner_radius=8, command=submit).pack(fill="x", padx=30, pady=10)
-            
+
         entry.bind("<KeyRelease>", on_typing)
 
     def add_stock_from_modal(self, name, symbol, stock_type, price, qty, modal_window):
@@ -1199,7 +1800,7 @@ class GTDApp:
                 from tkinter import messagebox
                 messagebox.showwarning("중복 경고", f"⚠️ {name}은(는) 이미 등록된 자산입니다.", parent=modal_window)
                 return False
-                
+
             new_row = pd.DataFrame([{
                 "username": self.current_user,
                 "type": stock_type,
@@ -1210,7 +1811,7 @@ class GTDApp:
             }])
             df = pd.concat([df, new_row], ignore_index=True)
             df.to_csv(config.PORTFOLIO_DB_PATH, index=False, encoding="utf-8-sig")
-            
+
             # 목록 새로고침 및 모달창 닫기
             self.refresh_stock_list()
             modal_window.destroy()
@@ -1248,7 +1849,7 @@ class GTDApp:
         for item in matched_list:
             symbol = item["symbol"]
             display_name = item["name"]
-            
+
             row_frame = ctk.CTkFrame(self.suggest_box, fg_color="transparent", height=44, cursor="hand2")
             row_frame.pack(fill="x", padx=5, pady=2)
             row_frame.pack_propagate(False)
@@ -1257,20 +1858,20 @@ class GTDApp:
             s_logo = ctk.CTkLabel(row_frame, text="", image=self.make_placeholder_logo(symbol, size=30))
             s_logo.pack(side="left", padx=(8, 4))
             self.load_logo_to_label_async(symbol, s_logo, size=30)
-            
+
             short_title = display_name[:22] + ".." if len(display_name) > 22 else display_name
             n_lbl = ctk.CTkLabel(row_frame, text=f"{short_title} ({symbol})", font=(self.font_family, 13, "bold"), text_color="#191F28", anchor="w")
             n_lbl.pack(side="left", padx=4, fill="x", expand=True)
-            
+
             def on_ent(e, f=row_frame): f.configure(fg_color="#F2F4F6")
             def on_lv(e, f=row_frame): f.configure(fg_color="transparent")
-            
+
             def select_item(e, name=display_name, sym=symbol):
                 if self.is_widget_alive("add_name"):
                     self.add_name.delete(0, 'end')
                     self.add_name.insert(0, f"{name} ({sym})")
                 self.suggest_box.place_forget()
-                
+
             for comp in (row_frame, s_logo, n_lbl):
                 comp.bind("<Enter>", on_ent)
                 comp.bind("<Leave>", on_lv)
@@ -1283,7 +1884,7 @@ class GTDApp:
         if not query or len(query) < 1: return []
         results = []
         is_english = all(ord(c) < 128 for c in query)
-        
+
         try:
             url = "https://ac.stock.naver.com/ac"
             headers = {
@@ -1340,7 +1941,7 @@ class GTDApp:
             if user_df.empty:
                 ctk.CTkLabel(self.stock_list_scroll, text="자산 항목이 비어있습니다.", font=(self.font_family, 14), text_color="#8B95A1").pack(pady=50)
                 return
-            
+
             for _, row in user_df.iterrows():
                 full_display_name = row["stock_name"]
                 symbol = full_display_name.split("(")[-1].replace(")", "").strip() if "(" in full_display_name else full_display_name
@@ -1404,11 +2005,11 @@ class GTDApp:
         input_name = self.add_name.get().strip()
         price = self.add_price.get().strip() if stock_type == "투자" else "0"
         qty = self.add_qty.get().strip() if stock_type == "투자" else "0"
-        
+
         if not input_name:
             self.add_status_lbl.configure(text="⚠️ 종목명을 입력해주세요.", text_color="#F04452")
             return
-            
+
         if stock_type == "투자":
             if not price or not qty:
                 self.add_status_lbl.configure(text="⚠️ 평단가와 보유량을 모두 입력해주세요.", text_color="#F04452")
@@ -1437,11 +2038,11 @@ class GTDApp:
             }])
             df = pd.concat([df, new_row], ignore_index=True)
             df.to_csv(config.PORTFOLIO_DB_PATH, index=False, encoding="utf-8-sig")
-            
+
             self.add_name.delete(0, 'end')
             self.add_price.delete(0, 'end')
             self.add_qty.delete(0, 'end')
-            
+
             self.add_status_lbl.configure(text="✅ 자산이 성공적으로 추가되었습니다.", text_color="#009432")
             self.refresh_stock_list()
         except Exception as e:
@@ -1508,14 +2109,14 @@ class GTDApp:
         # 1. 헤더 카드 디자인
         header_card = ctk.CTkFrame(detail_scroll, fg_color="#3182F6" if is_invest else "#FF9200", corner_radius=16)
         header_card.pack(fill="x", padx=10, pady=10)
-        
+
         # 수익률 및 주가 표기 처리 (요구사항: 관심종목일 경우 '해당 종목을 매수하지 않았습니다' 노출)
         if is_invest:
             if current_real_price is not None:
                 buy_p = float(stock_row["buy_price"])
                 real_yield = ((current_real_price - buy_p) / buy_p) * 100
                 currency = "원" if ".KS" in parsed_symbol or ".KQ" in parsed_symbol else "$"
-                
+
                 header_text = f"📈 {stock_name_only} 투자 상세 분석 리포트"
                 sub_text = f"매수 평단가: {buy_p:,.0f}{currency} | 현재 주가: {current_real_price:,.0f}{currency} | 수익률: {real_yield:+.2f}%"
             else:
@@ -1589,16 +2190,16 @@ class GTDApp:
         rating_card = ctk.CTkFrame(detail_scroll, fg_color="#FFFFFF", border_width=1, border_color="#E5E8EB", corner_radius=16)
         rating_card.pack(fill="x", padx=10, pady=10)
         ctk.CTkLabel(rating_card, text="🎯 종합 투자 추천도", font=(self.font_family, 16, "bold"), text_color="#191F28").pack(anchor="w", padx=20, pady=(15, 5))
-        
+
         # 정교하게 계산된 타겟가 및 분석 지표
         import hashlib
         name_hash = int(hashlib.md5(stock_name_only.encode('utf-8')).hexdigest(), 16)
         score = 3.5 + (name_hash % 4) * 0.5 # 3.5, 4.0, 4.5, or 5.0
-        
+
         full_stars = int(score)
         empty_stars = 5 - full_stars
         mock_stars = "⭐" * full_stars + "☆" * empty_stars + f" ({score:.1f} / 5.0)"
-        
+
         # Fetch current price if available, otherwise use a cached or fallback price for target calculation
         calc_price = current_real_price
         if calc_price is None:
@@ -1607,12 +2208,12 @@ class GTDApp:
                 calc_price = cached_data[0]
             else:
                 calc_price = 100000.0 # fallback
-        
+
         currency = "원" if ".KS" in parsed_symbol or ".KQ" in parsed_symbol else "$"
         target_mult = 1.15 + (name_hash % 5) * 0.05
         target_val = calc_price * target_mult
         target_desc = f"{target_val:,.0f}{currency}" if ".KS" in parsed_symbol or ".KQ" in parsed_symbol else f"${target_val:,.2f}"
-        
+
         current_outlooks = [
             "글로벌 수요 탄탄하여 단기 실적 개선세 뚜렷",
             "업황 턴어라운드 및 주요 고객사 다변화 가속",
@@ -1620,10 +2221,10 @@ class GTDApp:
             "신제품 출시 효과 및 시장 점유율 점진적 상승"
         ]
         current_outlook = current_outlooks[name_hash % len(current_outlooks)]
-        
+
         sector_info = self.get_stock_sector_info(parsed_symbol)
         sector_name = sector_info["sector"]
-        
+
         future_outlooks = {
             "반도체": "AI 및 데이터센터용 차세대 반도체(HBM/DDR5) 수요 폭증으로 장기 고성장 지속 전망",
             "인터넷/플랫폼": "AI 클라우드 서비스 고도화 및 매크로 광고 단가 회복세로 장기 지배력 강화 전망",
@@ -1633,7 +2234,7 @@ class GTDApp:
             "일반금융": "포트폴리오 다각화 및 배당 매력도로 장기적 우상향 및 안정성 강세 유지 전망"
         }
         future_outlook = future_outlooks.get(sector_name, "신시장 개척 및 탄탄한 캐시카우 기반 장기 성장 궤도 안착 기대")
-        
+
         grid_frame = ctk.CTkFrame(rating_card, fg_color="transparent")
         grid_frame.pack(fill="x", padx=20, pady=(0, 15))
         grid_frame.columnconfigure((0, 1, 2), weight=1)
@@ -1642,7 +2243,7 @@ class GTDApp:
         self.create_analysis_badge(grid_frame, 0, "목표 주가", target_desc)
         self.create_analysis_badge(grid_frame, 1, "현재 전망", current_outlook)
         self.create_analysis_badge(grid_frame, 2, "미래 전망", future_outlook)
-        
+
         # 추천도 별점 표시
         ctk.CTkLabel(rating_card, text=f"평가 스코어: {mock_stars}", font=(self.font_family, 15, "bold"), text_color="#3182F6").pack(anchor="w", padx=20, pady=(0, 15))
 
@@ -1912,7 +2513,7 @@ class GTDApp:
             news_header = ctk.CTkFrame(self.news_timeline, fg_color="transparent")
             news_header.pack(fill="x", padx=20, pady=(15, 5))
             ctk.CTkLabel(news_header, text="📰 24시간 신규 실시간 뉴스 피드", font=(self.font_family, 16, "bold"), text_color="#191F28").pack(side="left")
-            
+
             self.btn_news_refresh = ctk.CTkButton(
                 news_header, text="🔄 뉴스 새로고침", width=110, height=28, font=(self.font_family, 12, "bold"),
                 fg_color="#E8F3FF", text_color="#3182F6", hover_color="#D0E6FF", corner_radius=8,
@@ -2578,7 +3179,7 @@ class GTDApp:
     def refresh_stock_detail_news(self, stock_name, symbol):
         """뉴스 타임라인 로드 및 비동기 스레딩"""
         for w in self.news_container.winfo_children(): w.destroy()
-        
+
         loading_lbl = ctk.CTkLabel(self.news_container, text="24시간 신규 주식 뉴스 추종 분석 중...", font=(self.font_family, 13), text_color="#8B95A1")
         loading_lbl.pack(anchor="w", pady=10)
 
@@ -2591,108 +3192,48 @@ class GTDApp:
 
     def crawl_filtered_news_for_stock(self, stock_name, sector_name):
         """24시간 이내의 뉴스를 불러오되 중복을 제거(이전에 불러오지 않은 뉴스)"""
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        }
         news_results = []
         queries = [f"{stock_name} 주가", f"{sector_name} 뉴스"]
-        
+
         for q in queries:
             try:
-                url = "https://search.naver.com/search.naver?where=news&query=" + urllib.parse.quote(q)
-                res = requests.get(url, headers=headers, timeout=2.5)
-                if res.status_code == 200:
-                    soup = BeautifulSoup(res.text, 'html.parser')
-                    articles = soup.find_all('div', class_='news_info')
-                    
-                    for art in articles:
-                        time_lbl = art.find('span', class_='info')
-                        if not time_lbl: continue
-                        time_text = time_lbl.get_text().strip()
-                        
-                        # 24시간 이내 검사: 'N시간 전', 'N분 전', 'N초 전', '방금 전'
-                        is_within_24h = (
-                            "시간 전" in time_text or
-                            "분 전"  in time_text or
-                            "초 전"  in time_text or
-                            "방금"   in time_text
-                        )
-                        # 'N시간 전'이면 N < 24인지도 확인
-                        if "시간 전" in time_text:
-                            import re as _re
-                            m = _re.search(r"(\d+)\s*시간 전", time_text)
-                            if m and int(m.group(1)) >= 24:
-                                is_within_24h = False
-                        if not is_within_24h: continue
-                        
-                        title_node = art.parent.find('a', class_='news_tit')
-                        if not title_node: continue
-                        title = title_node.get_text().strip()
-                        link = title_node.get('href') or ""
-                        
-                        # 중복 제거 필터
-                        if title in self.shown_news_titles: continue
-                        
-                        sentiment = "복합"
-                        pos_words = ["상승", "호재", "돌파", "계약", "상향", "체결", "합의", "방한", "신기록", "M&A", "성공"]
-                        neg_words = ["하락", "악재", "부진", "우려", "쇼크", "급락", "적자", "감소", "분쟁", "소송"]
-                        if any(w in title for w in pos_words): sentiment = "호재"
-                        elif any(w in title for w in neg_words): sentiment = "악재"
-                        
-                        news_results.append({"title": title, "sentiment": sentiment, "link": link})
-                        self.shown_news_titles.add(title)
-                        
-                        if len(news_results) >= 3:
-                            return news_results
+                fetched = self._fetch_recent_naver_news(q, limit=3, seen_titles=self.shown_news_titles)
+                for item in fetched:
+                    sentiment, reason = self._classify_news_sentiment(item["title"])
+                    item["sentiment"] = sentiment
+                    item["sentiment_reason"] = reason
+                    news_results.append(item)
+                    self.shown_news_titles.add(item["title"])
+
+                    if len(news_results) >= 3:
+                        return news_results
             except Exception:
                 pass
-                
-        # 신규 뉴스가 부족할 시 다이나믹 가이드 플레이스홀더 제공 (호재/악재 분류 및 중복 필터)
-        if len(news_results) < 3:
-            import random
-            templates = [
-                ("[속보] {stock_name}, 차세대 {sector_name} 기술 특허 획득... 글로벌 공급망 독점 신호탄", "호재"),
-                ("{stock_name}, {sector_name} 핵심 소재 10년 장기 수급 계약 체결... 마진율 대폭 개선 기대", "호재"),
-                ("[단독] 글로벌 빅테크 기업, {stock_name}의 {sector_name} 솔루션 긴급 채택... 연간 수주액 2배 증가", "호재"),
-                ("{stock_name}, 신규 {sector_name} 생산라인 가동률 100% 돌파... 분기 사상 최대 실적 달성 가능성", "호재"),
-                ("기관·외인 {stock_name} 주식 연일 쌍끌이 순매수... {sector_name} 섹터 상승 랠리 주도", "호재"),
-                ("[시황] {stock_name}, 글로벌 {sector_name} 설비 투자 확대 수혜로 주가 강한 반등 추세 진입", "호재"),
-                ("{stock_name}, {sector_name} 분야 대규모 인수합병(M&A) 검토 완료 소식에 시장 이목 집중", "호재"),
-                ("외신 보고서 '{stock_name}, 전 세계 {sector_name} 생태계에서 독보적 입지 재확인'", "호재"),
-                ("[우려] {stock_name}, {sector_name} 원자재 글로벌 단기 물류 지연 영향으로 지지선 테스트 필요", "악재"),
-                ("{stock_name}, 글로벌 {sector_name} 경쟁 업체 증설 경쟁 심화에 따른 단기 마진 축소 우려", "악재"),
-                ("{stock_name}, {sector_name} 단기 업황 둔화 전망에 따라 보수적 리스크 관리 돌입", "악재"),
-            ]
-            
-            unused_templates = []
-            for t, sent in templates:
-                formatted_title = t.format(stock_name=stock_name, sector_name=sector_name)
-                if formatted_title not in self.shown_news_titles:
-                    # 실제 검색 결과가 나오는 간결한 키워드로 링크
-                    search_q = urllib.parse.quote(f"{stock_name} {sector_name} 주가 뉴스")
-                    fallback_link = f"https://search.naver.com/search.naver?where=news&query={search_q}"
-                    unused_templates.append({"title": formatted_title, "sentiment": sent, "link": fallback_link})
-            
-            random.shuffle(unused_templates)
-            for item in unused_templates:
-                if len(news_results) >= 3:
-                    break
-                news_results.append(item)
-                self.shown_news_titles.add(item["title"])
-                    
+
         return news_results[:3]
 
     def render_stock_detail_news_ui(self, news_list, sector_name):
         """상세 화면 하단에 24시간 뉴스 리스트 및 케이스 스터디 사례 2개 그리기"""
         if not self.is_widget_alive("news_container"): return
-        
+
         for w in self.news_container.winfo_children(): w.destroy()
-        
+
+        if not news_list:
+            ctk.CTkLabel(
+                self.news_container,
+                text="최근 24시간 내 확인된 신규 뉴스가 없습니다.",
+                font=(self.font_family, 13),
+                text_color="#8B95A1",
+                wraplength=620,
+                justify="left",
+            ).pack(anchor="w", pady=10)
+            return
+
         # 1. 3가지 뉴스 배치
         for news in news_list:
             row_frame = ctk.CTkFrame(self.news_container, fg_color="#F2F4F6",
-                                      height=60, corner_radius=8, cursor="hand2")
-            row_frame.pack(fill="x", pady=3)
+                                      height=84, corner_radius=8, cursor="hand2")
+            row_frame.pack(fill="x", pady=4)
             row_frame.pack_propagate(False)
 
             sentiment = news["sentiment"]
@@ -2703,11 +3244,26 @@ class GTDApp:
                                     corner_radius=5, height=20)
             tag_lbl.pack(side="left", padx=10)
 
-            title_lbl = ctk.CTkLabel(row_frame, text=news["title"],
-                                      font=(self.font_family, 12),
-                                      text_color="#191F28", anchor="w",
-                                      wraplength=500, justify="left")
-            title_lbl.pack(side="left", fill="x", expand=True, padx=(0, 8))
+            text_panel = ctk.CTkFrame(row_frame, fg_color="transparent")
+            text_panel.pack(side="left", fill="both", expand=True, pady=(9, 7))
+
+            title_lbl = ctk.CTkLabel(text_panel, text=news["title"],
+                                      font=(self.font_family, 12, "bold"),
+                                      text_color="#0B63CE", anchor="w",
+                                      wraplength=560, justify="left")
+            title_lbl.pack(anchor="w", fill="x")
+            meta_text = news.get("age_label", "최근 24시간")
+            if news.get("sentiment_reason"):
+                meta_text = f"{meta_text} · {news['sentiment_reason']}"
+            ctk.CTkLabel(
+                text_panel,
+                text=meta_text,
+                font=(self.font_family, 11),
+                text_color="#8B95A1",
+                anchor="w",
+                wraplength=560,
+                justify="left",
+            ).pack(anchor="w", fill="x", pady=(3, 0))
 
             def make_on_enter(rf):
                 return lambda e: rf.configure(fg_color="#E8F3FF")
@@ -2716,9 +3272,21 @@ class GTDApp:
 
             link = news.get("link")
             def make_click_handler(ln):
-                return lambda e: webbrowser.open(ln) if ln else None
+                return lambda e=None: self._open_url(ln)
 
             click_func = make_click_handler(link)
+            ctk.CTkButton(
+                row_frame,
+                text="열기",
+                width=56,
+                height=28,
+                font=(self.font_family, 11, "bold"),
+                fg_color="#3182F6",
+                text_color="#FFFFFF",
+                hover_color="#1B64DA",
+                corner_radius=7,
+                command=click_func,
+            ).pack(side="right", padx=(6, 10))
             for widget in (row_frame, tag_lbl, title_lbl):
                 widget.bind("<Button-1>", click_func)
                 widget.bind("<Enter>", make_on_enter(row_frame))
@@ -2726,22 +3294,22 @@ class GTDApp:
 
         # 2. 요구사항: 비슷한 소식이나 뉴스가 있던 주식들의 주가 추이 사례 2개 기능
         ctk.CTkLabel(self.news_container, text="💡 비슷한 소식이 있던 주식들의 주가 추이 사례 (2건)", font=(self.font_family, 14, "bold"), text_color="#3182F6").pack(anchor="w", pady=(15, 5))
-        
+
         # 첫 뉴스의 감정을 기준으로 주가 추이 사례 2가지 바인딩
         news_sentiment = news_list[0]["sentiment"] if news_list else "호재"
         cases = self.get_historical_cases(news_sentiment, sector_name)
-        
+
         cases_box = ctk.CTkFrame(self.news_container, fg_color="transparent")
         cases_box.pack(fill="x")
         cases_box.columnconfigure((0, 1), weight=1, uniform="equal")
 
         for index, cs in enumerate(cases):
-            case_card = ctk.CTkFrame(cases_box, fg_color="#FFF9E6", border_width=1, border_color="#FFE599", corner_radius=10, height=90)
+            case_card = ctk.CTkFrame(cases_box, fg_color="#FFF9E6", border_width=1, border_color="#FFE599", corner_radius=10, height=118)
             case_card.grid(row=0, column=index, padx=4, sticky="ew")
             case_card.pack_propagate(False)
 
             ctk.CTkLabel(case_card, text=f"{cs['company']} • {cs['trend']}", font=(self.font_family, 13, "bold"), text_color="#B78103").pack(anchor="w", padx=12, pady=(10, 2))
-            ctk.CTkLabel(case_card, text=cs["reason"], font=(self.font_family, 12), text_color="#8F6B00", justify="left", wraplength=190).pack(anchor="w", padx=12)
+            ctk.CTkLabel(case_card, text=cs["reason"], font=(self.font_family, 12), text_color="#8F6B00", justify="left", wraplength=260).pack(anchor="w", padx=12)
 
     def get_historical_cases(self, sentiment, sector):
         """과거 비슷한 감정 소식 발생 사례 분석 2개 반환"""
@@ -2766,7 +3334,7 @@ class GTDApp:
                     {"company": "엔비디아(NVDA)", "trend": "상승 추이", "reason": "차세대 아키텍처 출시 및 목표 주가 상향 리포트 발행 후 주가 5.4% 급등"},
                     {"company": "SK하이닉스", "trend": "상승 추이", "reason": "글로벌 대형 빅테크 기업과의 HBM 장기 공급 계약 수주 발표로 강세"}
                 ]
-        else: # 악재
+        elif sentiment == "악재":
             if sector == "반도체":
                 return [
                     {"company": "인텔(INTC)", "trend": "하락 추이", "reason": "파운드리 부문 영업 손실 확대 공시 이후 주가 12% 급락"},
@@ -2787,6 +3355,11 @@ class GTDApp:
                     {"company": "테슬라(TSLA)", "trend": "하락 추이", "reason": "분기 인도 차량 대수 기대치 미달 공시 직후 매도 폭증하며 하락"},
                     {"company": "캐터필러(CAT)", "trend": "하락 추이", "reason": "글로벌 인프라 수주 잔고 감소 뉴스로 경기 둔화 우려 반영되며 하락"}
                 ]
+        else:
+            return [
+                {"company": "삼성전자", "trend": "혼조 추이", "reason": "실적 기대와 업황 우려가 함께 나온 구간에서는 수급에 따라 등락이 엇갈림"},
+                {"company": "S&P 500", "trend": "변동성 확대", "reason": "금리·실적·정책 뉴스가 동시에 반영될 때 지수는 방향성보다 변동성이 먼저 커짐"}
+            ]
 
     # ─────────── 로고 도메인 매핑 (국내 + 해외 주요 종목) ───────────
     DOMAIN_MAP = {
