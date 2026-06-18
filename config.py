@@ -10,6 +10,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 USER_DB_PATH = os.path.join(DATA_DIR, "users.csv")
 PORTFOLIO_DB_PATH = os.path.join(DATA_DIR, "portfolios.csv")
 APP_SETTINGS_PATH = os.path.join(DATA_DIR, "app_settings.json")
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 
 # 모던 UI 테마 정의
 APPEARANCE_MODE = "light" # 밝은 토스 스타일 라이트 모드

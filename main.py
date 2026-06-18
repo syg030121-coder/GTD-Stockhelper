@@ -11,6 +11,7 @@ import pandas as pd
 from bs4 import BeautifulSoup
 import config
 from tkinter import font
+import tkinter as tk
 import webbrowser
 
 class GTDApp:
@@ -63,6 +64,9 @@ class GTDApp:
         self.daily_news_cache_date = None
         self.daily_news_cache_time = None
         self.search_timer = None
+        self.news_auto_refresh_job = None
+        self.news_auto_refresh_running = False
+        self.news_auto_refresh_interval_ms = 10 * 60 * 1000
 
         # 💡 이전에 불러오지 않은 뉴스 필터링용 히스토리 셋
         self.shown_news_titles = set()
@@ -204,6 +208,43 @@ class GTDApp:
             if not self._use_compact_dashboard():
                 width = width // 2
         return max(min_width, min(max_width, width - reserve))
+
+    def _create_bidirectional_scroll_area(self, parent, min_content_width=900):
+        host = ctk.CTkFrame(parent, fg_color="transparent", corner_radius=0)
+        host.pack(fill="both", expand=True)
+        host.grid_rowconfigure(0, weight=1)
+        host.grid_columnconfigure(0, weight=1)
+
+        canvas = tk.Canvas(
+            host,
+            background="#F9FAFB",
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        canvas.grid(row=0, column=0, sticky="nsew")
+
+        vertical_scroll = ctk.CTkScrollbar(host, orientation="vertical", command=canvas.yview)
+        vertical_scroll.grid(row=0, column=1, sticky="ns")
+        horizontal_scroll = ctk.CTkScrollbar(host, orientation="horizontal", command=canvas.xview)
+        horizontal_scroll.grid(row=1, column=0, sticky="ew")
+        canvas.configure(
+            yscrollcommand=vertical_scroll.set,
+            xscrollcommand=horizontal_scroll.set,
+        )
+
+        content = ctk.CTkFrame(canvas, fg_color="transparent", corner_radius=0)
+        window_id = canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def update_scroll_region(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def fit_content_width(event):
+            canvas.itemconfigure(window_id, width=max(min_content_width, event.width))
+            update_scroll_region()
+
+        content.bind("<Configure>", update_scroll_region)
+        canvas.bind("<Configure>", fit_content_width)
+        return content
 
     def _render_card_header(self, parent, title, subtitle="", title_color="#191F28"):
         header = ctk.CTkFrame(parent, fg_color="transparent")
@@ -660,8 +701,47 @@ class GTDApp:
             print(f"[디버깅] 로그인 오류: {e}")
 
     def handle_logout(self):
+        self._cancel_home_news_auto_refresh()
         self.current_user = None
         self.show_auth_page()
+
+    def _cancel_home_news_auto_refresh(self):
+        if self.news_auto_refresh_job is not None:
+            try:
+                self.root.after_cancel(self.news_auto_refresh_job)
+            except Exception:
+                pass
+        self.news_auto_refresh_job = None
+
+    def _schedule_home_news_auto_refresh(self):
+        self._cancel_home_news_auto_refresh()
+        if self.current_user:
+            self.news_auto_refresh_job = self.root.after(
+                self.news_auto_refresh_interval_ms,
+                self._run_home_news_auto_refresh,
+            )
+
+    def _run_home_news_auto_refresh(self):
+        self.news_auto_refresh_job = None
+        if not self.current_user:
+            return
+
+        self.daily_news_cache = None
+        self.daily_news_cache_date = None
+        self.daily_news_cache_time = None
+
+        if self.active_tab == "dashboard" and not self.news_auto_refresh_running:
+            self.news_auto_refresh_running = True
+
+            def refresh_worker():
+                try:
+                    self.load_dashboard_data_async()
+                finally:
+                    self.news_auto_refresh_running = False
+
+            threading.Thread(target=refresh_worker, daemon=True).start()
+
+        self._schedule_home_news_auto_refresh()
 
     def show_main_dashboard(self):
         """대시보드 메인 레이아웃 렌더링"""
@@ -681,6 +761,7 @@ class GTDApp:
         self.render_sidebar()
         self.root.update_idletasks()
         self.switch_tab("dashboard")
+        self._schedule_home_news_auto_refresh()
 
     def render_sidebar(self):
         brand_logo = self.get_brand_logo_image()
@@ -751,17 +832,10 @@ class GTDApp:
         """메인 대시보드 화면 구성"""
         # ── 스크롤 가능한 전체 컨텐츠 래퍼
         self._dashboard_layout_mode = "compact" if self._use_compact_dashboard() else "wide"
-        dash_scroll = ctk.CTkScrollableFrame(self.content_area, fg_color="transparent")
-        dash_scroll.pack(fill="both", expand=True)
-        try:
-            dash_scroll._parent_canvas.bind(
-                "<Configure>",
-                lambda event, frame=dash_scroll: frame._parent_canvas.itemconfigure(
-                    frame._create_window_id, width=max(1, event.width)
-                )
-            )
-        except Exception:
-            pass
+        dash_scroll = self._create_bidirectional_scroll_area(
+            self.content_area,
+            min_content_width=900,
+        )
 
         # ── 헤더 ──────────────────────────────────────────────────────
         header_frame = ctk.CTkFrame(dash_scroll, fg_color="transparent")
@@ -884,7 +958,7 @@ class GTDApp:
         self._render_card_header(
             self.news_card,
             "24시간 주요 뉴스",
-            "제목이나 기사 버튼을 누르면 원문을 열고, 분석 버튼으로 쉬운 해설을 볼 수 있어요.",
+            "PC 시각 기준 최근 24시간 · 10분마다 자동 갱신 · 기사 버튼으로 원문을 열 수 있어요.",
         )
         self.news_scroll = ctk.CTkFrame(self.news_card, fg_color="transparent")
         self.news_scroll.pack(fill="both", expand=True, padx=15, pady=(0, 15))
@@ -984,7 +1058,7 @@ class GTDApp:
             yld_col = "#F04452" if yld >= 0 else "#3182F6"
             item = ctk.CTkFrame(right, fg_color="#F2F4F6", corner_radius=10)
             item.pack(side="left", padx=4)
-            ctk.CTkLabel(item, text=name[:6], font=(self.font_family, 10),
+            ctk.CTkLabel(item, text=name, font=(self.font_family, 10),
                          text_color="#8B95A1").pack(padx=10, pady=(6, 0))
             ctk.CTkLabel(item, text=f"{'+' if yld >= 0 else ''}{yld:.1f}%",
                          font=(self.font_family, 13, "bold"),
@@ -1188,7 +1262,6 @@ class GTDApp:
                 news_item = ctk.CTkFrame(self.news_scroll, fg_color="#F2F4F6",
                                           height=140, corner_radius=12, cursor="hand2")
                 news_item.pack(fill="x", pady=5)
-                news_item.pack_propagate(False)
 
                 symbol = news.get("symbol", "GENERIC")
                 logo_lbl = ctk.CTkLabel(news_item, text="", image=self.make_placeholder_logo(symbol))
@@ -1302,7 +1375,6 @@ class GTDApp:
 
                 comp_card = ctk.CTkFrame(self.sector_companies_box, fg_color="#F2F4F6", height=65, corner_radius=12)
                 comp_card.grid(row=row_idx, column=col_idx, padx=4, pady=4, sticky="ew")
-                comp_card.pack_propagate(False)
 
                 symbol = comp["symbol"]
                 s_logo_lbl = ctk.CTkLabel(comp_card, text="", image=self.make_placeholder_logo(symbol))
@@ -1408,12 +1480,9 @@ class GTDApp:
         full_name = stock_row["stock_name"]
         symbol = full_name.split("(")[-1].replace(")", "").strip() if "(" in full_name else full_name
         display_name = full_name.split(" (")[0]
-        if len(display_name) > 18:
-            display_name = display_name[:17] + "..."
 
         card = ctk.CTkFrame(parent_scroll, fg_color="#F2F4F6", height=68, corner_radius=12, cursor="hand2")
         card.pack(fill="x", pady=4, padx=5)
-        card.pack_propagate(False)
 
         logo_lbl = ctk.CTkLabel(card, text="", image=self.make_placeholder_logo(symbol))
         logo_lbl.pack(side="left", padx=12)
@@ -1421,7 +1490,15 @@ class GTDApp:
 
         name_box = ctk.CTkFrame(card, fg_color="transparent")
         name_box.pack(side="left", fill="x", expand=True, padx=5, pady=10)
-        name_lbl = ctk.CTkLabel(name_box, text=display_name, font=(self.font_family, 15, "bold"), text_color="#191F28", anchor="w")
+        name_lbl = ctk.CTkLabel(
+            name_box,
+            text=display_name,
+            font=(self.font_family, 15, "bold"),
+            text_color="#191F28",
+            anchor="w",
+            justify="left",
+            wraplength=self._widget_wraplength(card, max_width=320, min_width=160, reserve=210),
+        )
         name_lbl.pack(anchor="w", fill="x")
         symbol_lbl = ctk.CTkLabel(name_box, text=symbol, font=(self.font_family, 11), text_color="#8B95A1", anchor="w")
         symbol_lbl.pack(anchor="w", fill="x")
@@ -1456,12 +1533,13 @@ class GTDApp:
 
     def get_daily_cached_news(self):
         """최근 24시간 이내의 대형 증시 뉴스 3가지 연동"""
+        # datetime.now()는 사용 중인 PC의 로컬 시간을 기준으로 한다.
         now = datetime.datetime.now()
         today_str = now.strftime("%Y-%m-%d")
         if (
             self.daily_news_cache
             and self.daily_news_cache_time
-            and now - self.daily_news_cache_time < datetime.timedelta(minutes=30)
+            and now - self.daily_news_cache_time < datetime.timedelta(minutes=10)
         ):
             return self.daily_news_cache
 
@@ -1600,7 +1678,7 @@ class GTDApp:
 투자자가 추가로 확인해야 할 지표나 뉴스 1가지"""
 
                 response = client.models.generate_content(
-                    model="gemini-2.5-flash", contents=prompt)
+                    model=config.GEMINI_MODEL, contents=prompt)
                 result = response.text
                 def update_ui():
                     try:
@@ -1655,7 +1733,7 @@ class GTDApp:
   ]
 }"""
             response = client.models.generate_content(
-                model="gemini-2.5-flash", contents=prompt)
+                model=config.GEMINI_MODEL, contents=prompt)
             import re, json
             text = response.text.strip()
             text = re.sub(r"^```json\s*", "", text)
@@ -1718,7 +1796,7 @@ class GTDApp:
 
         ctk.CTkLabel(
             api_card,
-            text="Gemini AI",
+            text="Gemini 3.1 Flash-Lite",
             font=(self.font_family, 18, "bold"),
             text_color="#191F28",
         ).pack(anchor="w", padx=22, pady=(20, 4))
@@ -1837,7 +1915,7 @@ class GTDApp:
                     from google import genai as gai
                     client = gai.Client(api_key=api_key)
                     response = client.models.generate_content(
-                        model="gemini-2.5-flash",
+                        model=config.GEMINI_MODEL,
                         contents="연결 확인",
                     )
                     if not getattr(response, "text", ""):
@@ -1888,7 +1966,11 @@ class GTDApp:
 
     def render_portfolio_tab(self):
         """포트폴리오 관리 탭"""
-        self.portfolio_split = ctk.CTkFrame(self.content_area, fg_color="transparent")
+        portfolio_scroll = self._create_bidirectional_scroll_area(
+            self.content_area,
+            min_content_width=1080,
+        )
+        self.portfolio_split = ctk.CTkFrame(portfolio_scroll, fg_color="transparent")
         self.portfolio_split.pack(fill="both", expand=True, padx=30, pady=20)
 
         self.port_left = ctk.CTkFrame(self.portfolio_split, fg_color="#FFFFFF", border_width=1, border_color="#E5E8EB", corner_radius=20, width=440)
@@ -2011,7 +2093,6 @@ class GTDApp:
             for item in results:
                 row = ctk.CTkFrame(results_scroll, fg_color="#FFFFFF", height=58, corner_radius=10, cursor="hand2")
                 row.pack(fill="x", pady=4, padx=2)
-                row.pack_propagate(False)
 
                 # 로고 비동기 로드 (즉시 플레이스홀더 표시 후 실제 로고 교체)
                 logo_lbl = ctk.CTkLabel(row, text="", image=self.make_placeholder_logo(item['symbol'], size=38))
@@ -2025,7 +2106,15 @@ class GTDApp:
                 # 종목명 + 코드 표시
                 text_box = ctk.CTkFrame(row, fg_color="transparent")
                 text_box.pack(side="left", fill="x", expand=True, padx=4)
-                ctk.CTkLabel(text_box, text=item['name'], font=(self.font_family, 13, "bold"), text_color="#191F28", anchor="w").pack(anchor="w")
+                ctk.CTkLabel(
+                    text_box,
+                    text=item['name'],
+                    font=(self.font_family, 13, "bold"),
+                    text_color="#191F28",
+                    anchor="w",
+                    justify="left",
+                    wraplength=240,
+                ).pack(anchor="w")
                 ctk.CTkLabel(text_box, text=item['symbol'], font=(self.font_family, 11), text_color="#8B95A1", anchor="w").pack(anchor="w")
 
                 for widget in (row, logo_lbl, text_box):
@@ -2161,15 +2250,21 @@ class GTDApp:
 
             row_frame = ctk.CTkFrame(self.suggest_box, fg_color="transparent", height=44, cursor="hand2")
             row_frame.pack(fill="x", padx=5, pady=2)
-            row_frame.pack_propagate(False)
 
             # 로고 (비동기 로드)
             s_logo = ctk.CTkLabel(row_frame, text="", image=self.make_placeholder_logo(symbol, size=30))
             s_logo.pack(side="left", padx=(8, 4))
             self.load_logo_to_label_async(symbol, s_logo, size=30)
 
-            short_title = display_name[:22] + ".." if len(display_name) > 22 else display_name
-            n_lbl = ctk.CTkLabel(row_frame, text=f"{short_title} ({symbol})", font=(self.font_family, 13, "bold"), text_color="#191F28", anchor="w")
+            n_lbl = ctk.CTkLabel(
+                row_frame,
+                text=f"{display_name} ({symbol})",
+                font=(self.font_family, 13, "bold"),
+                text_color="#191F28",
+                anchor="w",
+                justify="left",
+                wraplength=300,
+            )
             n_lbl.pack(side="left", padx=4, fill="x", expand=True)
 
             def on_ent(e, f=row_frame): f.configure(fg_color="#F2F4F6")
@@ -2257,13 +2352,20 @@ class GTDApp:
 
                 item_frame = ctk.CTkFrame(self.stock_list_scroll, fg_color="transparent", height=68, cursor="hand2")
                 item_frame.pack(fill="x", pady=2)
-                item_frame.pack_propagate(False)
 
                 logo_img_label = ctk.CTkLabel(item_frame, text="", image=self.make_placeholder_logo(symbol))
                 logo_img_label.pack(side="left", padx=(15, 15))
                 self.load_logo_to_label_async(symbol, logo_img_label)
 
-                name_lbl = ctk.CTkLabel(item_frame, text=full_display_name.split(" (")[0], font=(self.font_family, 16, "bold"), text_color="#191F28", anchor="w")
+                name_lbl = ctk.CTkLabel(
+                    item_frame,
+                    text=full_display_name.split(" (")[0],
+                    font=(self.font_family, 16, "bold"),
+                    text_color="#191F28",
+                    anchor="w",
+                    justify="left",
+                    wraplength=260,
+                )
                 name_lbl.pack(side="left", fill="x", expand=True)
 
                 price_frame = ctk.CTkFrame(item_frame, fg_color="transparent")
@@ -2750,7 +2852,7 @@ class GTDApp:
 친근하고 이해하기 쉬운 말로 설명해주세요."""
 
                     response = client.models.generate_content(
-                        model="gemini-2.5-flash",
+                        model=config.GEMINI_MODEL,
                         contents=prompt
                     )
                     result_text = response.text
@@ -3543,7 +3645,6 @@ class GTDApp:
             row_frame = ctk.CTkFrame(self.news_container, fg_color="#F2F4F6",
                                       height=84, corner_radius=8, cursor="hand2")
             row_frame.pack(fill="x", pady=4)
-            row_frame.pack_propagate(False)
 
             sentiment = news["sentiment"]
             tag_color = "#2ECC71" if sentiment == "호재" else "#F04452" if sentiment == "악재" else "#8B95A1"
@@ -3615,10 +3716,9 @@ class GTDApp:
         for index, cs in enumerate(cases):
             case_card = ctk.CTkFrame(cases_box, fg_color="#FFF9E6", border_width=1, border_color="#FFE599", corner_radius=10, height=118)
             case_card.grid(row=0, column=index, padx=4, sticky="ew")
-            case_card.pack_propagate(False)
 
             ctk.CTkLabel(case_card, text=f"{cs['company']} • {cs['trend']}", font=(self.font_family, 13, "bold"), text_color="#B78103").pack(anchor="w", padx=12, pady=(10, 2))
-            ctk.CTkLabel(case_card, text=cs["reason"], font=(self.font_family, 12), text_color="#8F6B00", justify="left", wraplength=260).pack(anchor="w", padx=12)
+            ctk.CTkLabel(case_card, text=cs["reason"], font=(self.font_family, 12), text_color="#8F6B00", justify="left", wraplength=260).pack(anchor="w", padx=12, pady=(0, 10))
 
     def get_historical_cases(self, sentiment, sector):
         """과거 비슷한 감정 소식 발생 사례 분석 2개 반환"""
@@ -3890,7 +3990,9 @@ class GTDApp:
         self.stock_info_cache.clear()
         self.daily_news_cache = None
         self.daily_news_cache_date = None
+        self.daily_news_cache_time = None
         self.switch_tab(self.active_tab)
+        self._schedule_home_news_auto_refresh()
 
 if __name__ == "__main__":
     app = GTDApp()
