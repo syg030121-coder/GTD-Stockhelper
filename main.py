@@ -66,6 +66,8 @@ class GTDApp:
         self._market_refresh_inflight = False
         self.market_value_labels = {}
         self.market_updated_label = None
+        self.usd_krw_rate = None
+        self.usd_krw_rate_time = None
         self.search_timer = None
 
         # 💡 이전에 불러오지 않은 뉴스 필터링용 히스토리 셋
@@ -356,6 +358,47 @@ class GTDApp:
         self._market_refresh_inflight = True
         threading.Thread(target=self._load_market_overview_data, daemon=True).start()
 
+    def _is_korean_symbol(self, symbol):
+        normalized = str(symbol or "").upper()
+        return normalized.endswith(".KS") or normalized.endswith(".KQ")
+
+    def _convert_amount_to_krw(self, symbol, amount, usd_krw_rate=None):
+        amount = float(amount)
+        if self._is_korean_symbol(symbol):
+            return amount
+        if not usd_krw_rate or float(usd_krw_rate) <= 0:
+            raise ValueError("미국 종목의 원화 환산에 유효한 환율이 필요합니다.")
+        return amount * float(usd_krw_rate)
+
+    def _fetch_usd_krw_rate(self):
+        now = self._get_local_now()
+        if (
+            self.usd_krw_rate
+            and self.usd_krw_rate_time
+            and now - self.usd_krw_rate_time < datetime.timedelta(minutes=5)
+        ):
+            return self.usd_krw_rate
+
+        try:
+            encoded_symbol = urllib.parse.quote("KRW=X", safe="")
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded_symbol}"
+            response = requests.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=5,
+            )
+            response.raise_for_status()
+            result = response.json()["chart"]["result"][0]
+            rate = float(result["meta"]["regularMarketPrice"])
+            if rate <= 0:
+                raise ValueError("원/달러 환율이 0 이하입니다.")
+            self.usd_krw_rate = rate
+            self.usd_krw_rate_time = now
+            return rate
+        except Exception as exc:
+            print(f"[디버깅] 원/달러 환율 수집 오류: {exc}")
+            return None
+
     def _load_market_overview_data(self):
         market_specs = {
             "KRW=X": {"suffix": "원", "decimals": 2},
@@ -380,6 +423,9 @@ class GTDApp:
                     result = response.json()["chart"]["result"][0]
                     meta = result["meta"]
                     price = float(meta["regularMarketPrice"])
+                    if symbol == "KRW=X" and price > 0:
+                        self.usd_krw_rate = price
+                        self.usd_krw_rate_time = self._get_local_now()
                     previous_close = meta.get("chartPreviousClose") or meta.get("previousClose")
                     change_rate = None
                     if previous_close:
@@ -968,14 +1014,15 @@ class GTDApp:
         alloc_hdr.pack(fill="x", padx=20, pady=(16, 6))
         ctk.CTkLabel(alloc_hdr, text="내 돈이 어디에 들어가 있나요?",
                      font=(self.font_family, 16, "bold"), text_color="#191F28").pack(side="left")
-        ctk.CTkLabel(
+        self.allocation_subtitle_label = ctk.CTkLabel(
             alloc_card,
-            text="종목을 추가하면 종목별, 섹터별, 국내·미국장 비율을 한눈에 보여드려요.",
+            text="모든 평가금액을 원화 기준으로 환산해 비율을 보여드려요.",
             font=(self.font_family, 12),
             text_color="#8B95A1",
             wraplength=self._content_wraplength(max_width=1200, reserve=80),
             justify="left",
-        ).pack(anchor="w", padx=20, pady=(0, 8))
+        )
+        self.allocation_subtitle_label.pack(anchor="w", padx=20, pady=(0, 8))
 
         self._alloc_chart_frame = ctk.CTkFrame(alloc_card, fg_color="transparent")
         self._alloc_chart_frame.pack(fill="x", padx=10, pady=(0, 12))
@@ -1061,12 +1108,27 @@ class GTDApp:
         ctk.CTkLabel(self.return_banner, text="내 종목 수익률을 계산 중입니다.",
                      font=(self.font_family, 13), text_color="#8B95A1").pack(anchor="w", padx=24, pady=18)
 
-    def _render_return_banner(self, invest_df):
-        """투자 종목 기준 총 수익률 배너 렌더링 (비동기 결과 수신 후 호출)"""
+    def _render_return_banner(self, invest_df, usd_krw_rate=None):
+        """국내·미국 투자 종목을 원화로 통일해 총 수익률을 계산한다."""
         try:
             if not self.return_banner.winfo_exists(): return
             for w in self.return_banner.winfo_children(): w.destroy()
         except Exception: return
+
+        has_us_stock = any(
+            not self._is_korean_symbol(
+                str(row["stock_name"]).split("(")[-1].replace(")", "").strip()
+            )
+            for _, row in invest_df.iterrows()
+        )
+        if has_us_stock and not usd_krw_rate:
+            ctk.CTkLabel(
+                self.return_banner,
+                text="원/달러 환율을 불러오는 중입니다. 잠시 후 새로고침해 주세요.",
+                font=(self.font_family, 13),
+                text_color="#8B95A1",
+            ).pack(anchor="w", padx=24, pady=18)
+            return
 
         rows_data = []
         total_cost = 0.0
@@ -1082,8 +1144,8 @@ class GTDApp:
             cached = self.stock_info_cache.get(sym)
             cp = float(cached[0]) if cached and cached[0] is not None else None
             if cp is None: continue
-            cost = bp * bq
-            val  = cp * bq
+            cost = self._convert_amount_to_krw(sym, bp * bq, usd_krw_rate)
+            val = self._convert_amount_to_krw(sym, cp * bq, usd_krw_rate)
             rows_data.append((sname.split(" (")[0], sym, cost, val, bp, cp, bq))
             total_cost += cost
             total_val  += val
@@ -1116,11 +1178,12 @@ class GTDApp:
                      font=(self.font_family, 12), text_color="#8B95A1").pack(anchor="w")
         ctk.CTkLabel(left, text=f"{sign}{total_yield:.2f}%",
                      font=(self.font_family, 28, "bold"), text_color=accent).pack(anchor="w")
-        is_kr = any(".KS" in r[1] or ".KQ" in r[1] for r in rows_data)
-        currency = "원" if is_kr else "$"
+        exchange_note = f" · 1달러={usd_krw_rate:,.2f}원" if has_us_stock else ""
         ctk.CTkLabel(left,
-                     text=f"투자 원금 {total_cost:,.0f}{currency}  →  평가금액 {total_val:,.0f}{currency}  ({sign}{profit:,.0f}{currency})",
-                     font=(self.font_family, 12), text_color="#4E5968").pack(anchor="w")
+                     text=f"원화 환산 투자 원금 {total_cost:,.0f}원  →  평가금액 {total_val:,.0f}원  ({sign}{profit:,.0f}원){exchange_note}",
+                     font=(self.font_family, 12), text_color="#4E5968",
+                     wraplength=self._content_wraplength(max_width=850, reserve=360),
+                     justify="left").pack(anchor="w")
 
         # 오른쪽: 종목별 미니 수익률
         right = ctk.CTkFrame(row_frame, fg_color="transparent")
@@ -1146,23 +1209,27 @@ class GTDApp:
             user_df = pd.DataFrame()
 
         invest_df = user_df[user_df["type"] == "투자"] if not user_df.empty else pd.DataFrame()
+        has_us_stock = False
 
         # 투자 종목 현재가 미리 캐시
         for _, row in invest_df.iterrows():
             sname = str(row["stock_name"])
             sym = sname.split("(")[-1].replace(")", "").strip() if "(" in sname else sname
+            has_us_stock = has_us_stock or not self._is_korean_symbol(sym)
             if sym not in self.stock_info_cache:
                 self.fetch_realtime_stock_info(sym)
+
+        usd_krw_rate = self._fetch_usd_krw_rate() if has_us_stock else None
 
         daily_news  = self.get_daily_cached_news()
         sector_info = self.get_weekly_cached_sector()
 
         self.root.after(0, lambda: self.render_dashboard_lists_ui(user_df, daily_news, sector_info))
-        self.root.after(0, lambda: self._render_return_banner(invest_df))
-        self.root.after(200, lambda: self._load_allocation_charts(invest_df))
+        self.root.after(0, lambda: self._render_return_banner(invest_df, usd_krw_rate))
+        self.root.after(200, lambda: self._load_allocation_charts(invest_df, usd_krw_rate))
 
-    def _load_allocation_charts(self, invest_df):
-        """투자 비율 도넛 차트 3종 렌더링 (종목별 / 섹터별 / 국내·미장)"""
+    def _load_allocation_charts(self, invest_df, usd_krw_rate=None):
+        """모든 평가금액을 원화로 환산해 도넛 차트 3종을 렌더링한다."""
         try:
             if not self._alloc_chart_frame.winfo_exists(): return
         except Exception: return
@@ -1172,6 +1239,22 @@ class GTDApp:
         sector_vals = {}  # sector → 평가금액
         kr_val = 0.0
         us_val = 0.0
+        has_us_stock = any(
+            not self._is_korean_symbol(
+                str(row["stock_name"]).split("(")[-1].replace(")", "").strip()
+            )
+            for _, row in invest_df.iterrows()
+        )
+        if has_us_stock and not usd_krw_rate:
+            for w in self._alloc_chart_frame.winfo_children():
+                w.destroy()
+            ctk.CTkLabel(
+                self._alloc_chart_frame,
+                text="미국 종목을 원화로 환산할 환율을 불러오지 못했습니다. 잠시 후 새로고침해 주세요.",
+                font=(self.font_family, 13),
+                text_color="#8B95A1",
+            ).pack(anchor="w", padx=20, pady=20)
+            return
 
         for _, row in invest_df.iterrows():
             sname = str(row["stock_name"])
@@ -1184,16 +1267,22 @@ class GTDApp:
                 continue
             cached = self.stock_info_cache.get(sym)
             cp = float(cached[0]) if cached and cached[0] is not None else bp
-            val = cp * bq
+            val = self._convert_amount_to_krw(sym, cp * bq, usd_krw_rate)
             stock_vals[short[:8]] = stock_vals.get(short[:8], 0) + val
 
             sec = self.get_stock_sector_info(sym).get("sector", "기타")
             sector_vals[sec] = sector_vals.get(sec, 0) + val
 
-            if ".KS" in sym or ".KQ" in sym:
+            if self._is_korean_symbol(sym):
                 kr_val += val
             else:
                 us_val += val
+
+        if self.is_widget_alive("allocation_subtitle_label"):
+            subtitle = "모든 평가금액을 원화 기준으로 환산해 비율을 보여드려요."
+            if has_us_stock:
+                subtitle += f" (1달러 = {usd_krw_rate:,.2f}원)"
+            self.allocation_subtitle_label.configure(text=subtitle)
 
         if not stock_vals:
             for w in self._alloc_chart_frame.winfo_children(): w.destroy()
@@ -2072,7 +2161,7 @@ class GTDApp:
         self.add_name.grid(row=0, column=0, columnspan=2, padx=12, pady=(12, 6), sticky="ew")
         self.add_name.bind("<KeyRelease>", self.on_search_typing_debounce)
 
-        self.add_price = ctk.CTkEntry(add_frame, placeholder_text="평단가", height=45, font=(self.font_family, 15), fg_color="#FFFFFF", border_width=1, border_color="#E5E8EB", corner_radius=10)
+        self.add_price = ctk.CTkEntry(add_frame, placeholder_text="평단가 (국내 원 / 미국 달러)", height=45, font=(self.font_family, 15), fg_color="#FFFFFF", border_width=1, border_color="#E5E8EB", corner_radius=10)
         self.add_price.grid(row=1, column=0, padx=(12, 6), pady=6, sticky="ew")
 
         self.add_qty = ctk.CTkEntry(add_frame, placeholder_text="보유량", height=45, font=(self.font_family, 15), fg_color="#FFFFFF", border_width=1, border_color="#E5E8EB", corner_radius=10)
@@ -2203,6 +2292,9 @@ class GTDApp:
                 btn_watch.pack(side="left", padx=2)
 
         def ask_invest_details(name, symbol):
+            is_korean = self._is_korean_symbol(symbol)
+            currency_name = "원(₩)" if is_korean else "달러($)"
+            price_example = "75000" if is_korean else "185.50"
             dialog = ctk.CTkToplevel(modal)
             dialog.title("투자 평단가/수량 입력")
             dialog.geometry("360x240")
@@ -2220,9 +2312,15 @@ class GTDApp:
             dy = py + (ph // 2) - (240 // 2)
             dialog.geometry(f"360x240+{dx}+{dy}")
 
-            ctk.CTkLabel(dialog, text=f"{name} ({symbol})", font=(self.font_family, 15, "bold"), text_color="#191F28").pack(pady=(20, 10))
+            ctk.CTkLabel(dialog, text=f"{name} ({symbol})", font=(self.font_family, 15, "bold"), text_color="#191F28").pack(pady=(16, 2))
+            ctk.CTkLabel(
+                dialog,
+                text=f"평단가는 {currency_name} 기준으로 입력해 주세요.",
+                font=(self.font_family, 12),
+                text_color="#8B95A1",
+            ).pack(pady=(0, 6))
 
-            price_entry = ctk.CTkEntry(dialog, placeholder_text="매수 평단가 입력 (예: 75000)", height=38, font=(self.font_family, 13), fg_color="#F2F4F6", border_width=1, border_color="#E5E8EB", corner_radius=8)
+            price_entry = ctk.CTkEntry(dialog, placeholder_text=f"매수 평단가 ({currency_name}, 예: {price_example})", height=38, font=(self.font_family, 13), fg_color="#F2F4F6", border_width=1, border_color="#E5E8EB", corner_radius=8)
             price_entry.pack(fill="x", padx=30, pady=4)
             price_entry.focus()
 
@@ -2578,10 +2676,15 @@ class GTDApp:
             if current_real_price is not None:
                 buy_p = float(stock_row["buy_price"])
                 real_yield = ((current_real_price - buy_p) / buy_p) * 100
-                currency = "원" if ".KS" in parsed_symbol or ".KQ" in parsed_symbol else "$"
+                if self._is_korean_symbol(parsed_symbol):
+                    buy_price_text = f"{buy_p:,.0f}원"
+                    current_price_text = f"{current_real_price:,.0f}원"
+                else:
+                    buy_price_text = f"${buy_p:,.2f}"
+                    current_price_text = f"${current_real_price:,.2f}"
 
                 header_text = f"📈 {stock_name_only} 투자 상세 분석 리포트"
-                sub_text = f"매수 평단가: {buy_p:,.0f}{currency} | 현재 주가: {current_real_price:,.0f}{currency} | 수익률: {real_yield:+.2f}%"
+                sub_text = f"매수 평단가: {buy_price_text} | 현재 주가: {current_price_text} | 수익률: {real_yield:+.2f}%"
             else:
                 header_text = f"📈 {stock_name_only} 상세 정보"
                 sub_text = "실시간 시세 수집 중..."
