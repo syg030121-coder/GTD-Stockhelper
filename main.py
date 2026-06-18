@@ -350,10 +350,13 @@ class GTDApp:
         }
         return "https://search.naver.com/search.naver?" + urllib.parse.urlencode(params)
 
+    def _get_local_now(self):
+        return datetime.datetime.now()
+
     def _parse_news_published_at(self, time_text, now=None):
         if not time_text:
             return None
-        now = now or datetime.datetime.now()
+        now = now or self._get_local_now()
         text = time_text.strip()
 
         if "방금" in text:
@@ -387,17 +390,18 @@ class GTDApp:
     def _is_within_24h(self, published_at, now=None):
         if not published_at:
             return False
-        now = now or datetime.datetime.now()
+        now = now or self._get_local_now()
         delta = now - published_at
         return datetime.timedelta(seconds=-60) <= delta <= datetime.timedelta(hours=24)
 
-    def _format_news_age(self, published_at, raw_label=""):
+    def _format_news_age(self, published_at, raw_label="", now=None):
         if raw_label and ("전" in raw_label or "방금" in raw_label):
             return raw_label
         if not published_at:
             return "최근 24시간"
 
-        delta = max(datetime.timedelta(), datetime.datetime.now() - published_at)
+        now = now or self._get_local_now()
+        delta = max(datetime.timedelta(), now - published_at)
         minutes = int(delta.total_seconds() // 60)
         if minutes < 1:
             return "방금 전"
@@ -409,6 +413,8 @@ class GTDApp:
         if not container:
             return "", None
 
+        now = self._get_local_now()
+
         candidates = []
         for node in container.find_all(["span", "em"]):
             text = node.get_text(" ", strip=True)
@@ -419,8 +425,8 @@ class GTDApp:
         candidates.extend(re.findall(r"방금 전|\d+\s*(?:초|분|시간|일)\s*전|\d{4}\.\d{1,2}\.\d{1,2}\.|\d{1,2}\.\d{1,2}\.", full_text))
 
         for text in candidates:
-            published_at = self._parse_news_published_at(text)
-            if published_at and self._is_within_24h(published_at):
+            published_at = self._parse_news_published_at(text, now=now)
+            if published_at and self._is_within_24h(published_at, now=now):
                 return text, published_at
         return "", None
 
@@ -538,6 +544,7 @@ class GTDApp:
         }
         seen_titles = seen_titles if seen_titles is not None else set()
         results = []
+        now = self._get_local_now()
         res = requests.get(self._build_naver_news_url(query), headers=headers, timeout=3)
         if res.status_code != 200:
             return results
@@ -564,7 +571,7 @@ class GTDApp:
             time_label, published_at = self._extract_news_time(container)
             if not published_at:
                 container, time_label, published_at = self._find_news_container_with_time(a)
-            if not self._is_within_24h(published_at):
+            if not self._is_within_24h(published_at, now=now):
                 continue
 
             sentiment, reason = self._classify_news_sentiment(title)
@@ -576,7 +583,7 @@ class GTDApp:
                 "sentiment": sentiment,
                 "sentiment_reason": reason,
                 "link": href,
-                "age_label": self._format_news_age(published_at, time_label),
+                "age_label": self._format_news_age(published_at, time_label, now=now),
                 "published_at": published_at.isoformat(timespec="minutes"),
             })
             if len(results) >= limit:
@@ -1456,7 +1463,7 @@ class GTDApp:
 
     def get_daily_cached_news(self):
         """최근 24시간 이내의 대형 증시 뉴스 3가지 연동"""
-        now = datetime.datetime.now()
+        now = self._get_local_now()
         today_str = now.strftime("%Y-%m-%d")
         if (
             self.daily_news_cache
@@ -1480,6 +1487,9 @@ class GTDApp:
                 news_list.extend(self._fetch_recent_naver_news(query, limit=needed, seen_titles=seen_titles))
         except Exception as e:
             print(f"[디버깅] 뉴스 연동 오류: {e}")
+
+        news_list = [item for item in news_list if item.get("published_at")]
+        news_list.sort(key=lambda item: item.get("published_at", ""), reverse=True)
 
         if not news_list:
             news_list.append({
@@ -1600,7 +1610,7 @@ class GTDApp:
 투자자가 추가로 확인해야 할 지표나 뉴스 1가지"""
 
                 response = client.models.generate_content(
-                    model="gemini-2.5-flash", contents=prompt)
+                    model="gemini-3.1-flash-lite", contents=prompt)
                 result = response.text
                 def update_ui():
                     try:
@@ -1655,7 +1665,7 @@ class GTDApp:
   ]
 }"""
             response = client.models.generate_content(
-                model="gemini-2.5-flash", contents=prompt)
+                model="gemini-3.1-flash-lite", contents=prompt)
             import re, json
             text = response.text.strip()
             text = re.sub(r"^```json\s*", "", text)
@@ -1724,7 +1734,7 @@ class GTDApp:
         ).pack(anchor="w", padx=22, pady=(20, 4))
         ctk.CTkLabel(
             api_card,
-            text="Google AI Studio에서 발급한 API 키",
+            text="Google AI Studio API 키를 사용하며, 모델은 gemini-3.1-flash-lite입니다.",
             font=(self.font_family, 12),
             text_color="#8B95A1",
         ).pack(anchor="w", padx=22, pady=(0, 12))
@@ -1830,14 +1840,14 @@ class GTDApp:
                 set_status("테스트할 Gemini API 키를 입력해 주세요.", "#F04452")
                 return
             test_button.configure(text="확인 중...", state="disabled")
-            set_status("Gemini 연결을 확인하고 있습니다.", "#3182F6")
+            set_status("Gemini 연결을 확인하고 있습니다. (gemini-3.1-flash-lite)", "#3182F6")
 
             def run_test():
                 try:
                     from google import genai as gai
                     client = gai.Client(api_key=api_key)
                     response = client.models.generate_content(
-                        model="gemini-2.5-flash",
+                        model="gemini-3.1-flash-lite",
                         contents="연결 확인",
                     )
                     if not getattr(response, "text", ""):
@@ -2750,7 +2760,7 @@ class GTDApp:
 친근하고 이해하기 쉬운 말로 설명해주세요."""
 
                     response = client.models.generate_content(
-                        model="gemini-2.5-flash",
+                        model="gemini-3.1-flash-lite",
                         contents=prompt
                     )
                     result_text = response.text
@@ -2837,11 +2847,12 @@ class GTDApp:
 
 
     def create_analysis_badge(self, parent, col, title, value):
-        badge = ctk.CTkFrame(parent, fg_color="#F2F4F6", height=65, corner_radius=10)
+        badge = ctk.CTkFrame(parent, fg_color="#F2F4F6", height=100, corner_radius=10)
         badge.grid(row=0, column=col, padx=4, sticky="ew")
-        badge.pack_propagate(False)
-        ctk.CTkLabel(badge, text=title, font=(self.font_family, 12, "bold"), text_color="#8B95A1").pack(anchor="w", padx=12, pady=(8, 2))
-        ctk.CTkLabel(badge, text=value, font=(self.font_family, 13, "bold"), text_color="#191F28").pack(anchor="w", padx=12)
+        badge.grid_propagate(False)
+        wraplength = self._widget_wraplength(parent, max_width=320, min_width=190, reserve=40)
+        ctk.CTkLabel(badge, text=title, font=(self.font_family, 12, "bold"), text_color="#8B95A1").pack(anchor="w", padx=12, pady=(10, 2))
+        ctk.CTkLabel(badge, text=value, font=(self.font_family, 13, "bold"), text_color="#191F28", justify="left", wraplength=wraplength).pack(anchor="w", padx=12, pady=(0, 4))
 
     # ──────────── 섹터 기준 벤치마크 (산업 평균) ────────────────────────
     SECTOR_BENCHMARKS = {
