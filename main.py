@@ -62,6 +62,10 @@ class GTDApp:
         self.daily_news_cache = None
         self.daily_news_cache_date = None
         self.daily_news_cache_time = None
+        self._market_refresh_job = None
+        self._market_refresh_inflight = False
+        self.market_value_labels = {}
+        self.market_updated_label = None
         self.search_timer = None
 
         # 💡 이전에 불러오지 않은 뉴스 필터링용 히스토리 셋
@@ -224,34 +228,6 @@ class GTDApp:
                 justify="left",
             ).pack(anchor="w", pady=(3, 0))
 
-    def _render_dashboard_notice(self, parent):
-        notice = ctk.CTkFrame(parent, fg_color="#FFF7E8", corner_radius=14)
-        notice.pack(
-            fill="x",
-            padx=self.dashboard_outer_padding,
-            pady=(0, self.dashboard_section_gap),
-        )
-        badge = ctk.CTkLabel(
-            notice,
-            text="초보자 모드",
-            width=86,
-            height=30,
-            font=(self.font_family, 12, "bold"),
-            text_color="#8F6B00",
-            fg_color="#FFE8B0",
-            corner_radius=15,
-        )
-        badge.pack(side="left", padx=(18, 12), pady=14)
-        ctk.CTkLabel(
-            notice,
-            text="1 투자 상태 -> 2 뉴스 -> 3 관심 종목",
-            font=(self.font_family, 14, "bold"),
-            text_color="#4E5968",
-            wraplength=self._content_wraplength(max_width=1100, reserve=180),
-            anchor="w",
-            justify="left",
-        ).pack(side="left", fill="x", expand=True, padx=(0, 18), pady=14)
-
     def _render_market_overview(self, parent):
         overview = ctk.CTkFrame(
             parent,
@@ -268,7 +244,6 @@ class GTDApp:
 
         top = ctk.CTkFrame(overview, fg_color="transparent")
         top.pack(fill="x", padx=20, pady=(16, 6))
-        compact = self._use_compact_dashboard()
         title_lbl = ctk.CTkLabel(
             top,
             text="시장 한눈에 보기",
@@ -277,35 +252,28 @@ class GTDApp:
         )
         desc_lbl = ctk.CTkLabel(
             top,
-            text="처음엔 가격보다 방향과 영향을 먼저 봐도 충분해요",
+            text="5분마다 자동 새로고침",
             font=(self.font_family, 12),
             text_color="#8B95A1",
             anchor="w",
             wraplength=440,
             justify="left",
         )
-        if compact:
-            title_lbl.pack(anchor="w")
-            desc_lbl.pack(anchor="w", pady=(2, 0))
-        else:
-            title_lbl.pack(side="left")
-            desc_lbl.pack(side="right")
+        title_lbl.pack(anchor="w")
+        desc_lbl.pack(anchor="w", pady=(2, 0))
 
         grid = ctk.CTkFrame(overview, fg_color="transparent")
-        grid.pack(fill="x", padx=12, pady=(0, 14))
-        columns = 2 if compact else 4
-        for col in range(columns):
-            grid.columnconfigure(col, weight=1, uniform="market")
+        grid.pack(anchor="w", padx=12, pady=(0, 14))
 
         items = [
-            ("D-2", "경제일정", "변동성 체크", "#4E5968", "#F2F4F6"),
-            ("환율", "달러/원", "해외주식 영향", "#B78103", "#FFF7E8"),
-            ("국내장", "국내지수", "국내 종목 분위기", "#3182F6", "#E8F3FF"),
-            ("해외장", "나스닥", "미국장 흐름", "#F04452", "#FFECEF"),
+            ("KRW", "원/달러 환율", "KRW=X", "#B78103", "#FFF7E8"),
+            ("KOSPI", "코스피 지수", "^KS11", "#3182F6", "#E8F3FF"),
+            ("NASDAQ", "나스닥 지수", "^IXIC", "#F04452", "#FFECEF"),
         ]
-        for index, (badge_text, title, caption, color, bg) in enumerate(items):
-            cell = ctk.CTkFrame(grid, fg_color="transparent", height=60)
-            cell.grid(row=index // columns, column=index % columns, sticky="ew", padx=5, pady=4)
+        self.market_value_labels = {}
+        for index, (badge_text, title, symbol, color, bg) in enumerate(items):
+            cell = ctk.CTkFrame(grid, fg_color="transparent", width=200, height=72)
+            cell.pack(side="left", padx=5, pady=4)
             cell.pack_propagate(False)
             ctk.CTkLabel(
                 cell,
@@ -316,25 +284,115 @@ class GTDApp:
                 text_color=color,
                 fg_color=bg,
                 corner_radius=12,
-            ).pack(side="left", padx=(0, 8), pady=17)
+            ).pack(side="left", padx=(0, 8), pady=21)
             text_box = ctk.CTkFrame(cell, fg_color="transparent")
-            text_box.pack(side="left", fill="both", expand=True, pady=10)
+            text_box.pack(side="left", fill="both", expand=True, pady=8)
             ctk.CTkLabel(
                 text_box,
                 text=title,
+                font=(self.font_family, 11),
+                text_color="#8B95A1",
+                anchor="w",
+            ).pack(anchor="w")
+            value_label = ctk.CTkLabel(
+                text_box,
+                text="불러오는 중...",
                 font=(self.font_family, 13, "bold"),
                 text_color="#191F28",
                 anchor="w",
-            ).pack(anchor="w")
-            ctk.CTkLabel(
-                text_box,
-                text=caption,
-                font=(self.font_family, 10),
-                text_color="#8B95A1",
-                anchor="w",
-                wraplength=120,
+                wraplength=135,
                 justify="left",
-            ).pack(anchor="w", fill="x")
+            )
+            value_label.pack(anchor="w", fill="x")
+            self.market_value_labels[symbol] = value_label
+
+        self.market_updated_label = desc_lbl
+        self._start_market_auto_refresh()
+
+    def _cancel_market_auto_refresh(self):
+        if self._market_refresh_job is not None:
+            try:
+                self.root.after_cancel(self._market_refresh_job)
+            except Exception:
+                pass
+            self._market_refresh_job = None
+
+    def _start_market_auto_refresh(self):
+        self._cancel_market_auto_refresh()
+        self._refresh_market_overview_async()
+        self._market_refresh_job = self.root.after(300_000, self._run_scheduled_market_refresh)
+
+    def _run_scheduled_market_refresh(self):
+        self._market_refresh_job = None
+        if self.active_tab != "dashboard" or not self.is_widget_alive("content_area"):
+            return
+        self._refresh_market_overview_async()
+        self._market_refresh_job = self.root.after(300_000, self._run_scheduled_market_refresh)
+
+    def _refresh_market_overview_async(self):
+        if self._market_refresh_inflight or not self.market_value_labels:
+            return
+        self._market_refresh_inflight = True
+        threading.Thread(target=self._load_market_overview_data, daemon=True).start()
+
+    def _load_market_overview_data(self):
+        market_specs = {
+            "KRW=X": {"suffix": "원", "decimals": 2},
+            "^KS11": {"suffix": "", "decimals": 2},
+            "^IXIC": {"suffix": "", "decimals": 2},
+        }
+        results = {}
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+        }
+
+        try:
+            for symbol, spec in market_specs.items():
+                try:
+                    encoded_symbol = urllib.parse.quote(symbol, safe="")
+                    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded_symbol}"
+                    response = requests.get(url, headers=headers, timeout=5)
+                    response.raise_for_status()
+                    result = response.json()["chart"]["result"][0]
+                    meta = result["meta"]
+                    price = float(meta["regularMarketPrice"])
+                    previous_close = meta.get("chartPreviousClose") or meta.get("previousClose")
+                    change_rate = None
+                    if previous_close:
+                        previous_close = float(previous_close)
+                        if previous_close:
+                            change_rate = (price - previous_close) / previous_close * 100
+
+                    decimals = spec["decimals"]
+                    value_text = f"{price:,.{decimals}f}{spec['suffix']}"
+                    if change_rate is not None:
+                        value_text += f"  {'+' if change_rate > 0 else ''}{change_rate:.2f}%"
+                    color = "#8B95A1"
+                    if change_rate is not None and change_rate > 0:
+                        color = "#F04452"
+                    elif change_rate is not None and change_rate < 0:
+                        color = "#3182F6"
+                    results[symbol] = (value_text, color)
+                except Exception as exc:
+                    print(f"[디버깅] 시장 지표 수집 오류 ({symbol}): {exc}")
+                    results[symbol] = ("정보 없음", "#8B95A1")
+        finally:
+            updated_at = self._get_local_now().strftime("%H:%M")
+            self.root.after(0, lambda: self._apply_market_overview_data(results, updated_at))
+
+    def _apply_market_overview_data(self, results, updated_at):
+        try:
+            for symbol, (text, color) in results.items():
+                label = self.market_value_labels.get(symbol)
+                if label is not None and label.winfo_exists():
+                    label.configure(text=text, text_color=color)
+            if self.market_updated_label is not None and self.market_updated_label.winfo_exists():
+                self.market_updated_label.configure(text=f"5분마다 자동 새로고침 · {updated_at} 기준")
+        finally:
+            self._market_refresh_inflight = False
 
     def _build_naver_news_url(self, query):
         """네이버 뉴스 검색을 최근 24시간, 최신순으로 고정."""
@@ -737,6 +795,7 @@ class GTDApp:
         ctk.CTkButton(user_card, text="로그아웃", width=65, height=30, font=(self.font_family, 12, "bold"), fg_color="#E5E8EB", text_color="#4E5968", hover_color="#D8DBDE", corner_radius=8, command=self.handle_logout).pack(side="right", padx=(0, 12), pady=21)
 
     def switch_tab(self, tab_name):
+        self._cancel_market_auto_refresh()
         self.active_tab = tab_name
         for name, btn in self.sidebar_buttons.items():
             if name == tab_name:
@@ -799,7 +858,6 @@ class GTDApp:
                       hover_color="#D0E6FF", corner_radius=10,
                       command=self.handle_global_refresh).pack(side="right", padx=(12, 0))
 
-        self._render_dashboard_notice(dash_scroll)
         self._render_market_overview(dash_scroll)
 
         # ── 총 투자 수익률 배너 ─────────────────────────────────────────
@@ -881,7 +939,7 @@ class GTDApp:
         self.watch_card = ctk.CTkFrame(left_col, fg_color="#FFFFFF",
                                         border_width=1, border_color="#E5E8EB", corner_radius=20)
         self.watch_card.pack(fill=card_fill, expand=card_expand, pady=(10, 0))
-        self._render_card_header(self.watch_card, "지켜볼 종목", "아직 사지 않았지만 보고 싶은 종목")
+        self._render_card_header(self.watch_card, "관심 종목", "아직 사지 않았지만 보고 싶은 종목")
         self.watch_scroll = ctk.CTkScrollableFrame(self.watch_card, fg_color="transparent")
         self.watch_scroll.pack(fill="both", expand=True, padx=10, pady=(0, 15))
 
@@ -1163,7 +1221,7 @@ class GTDApp:
             if watch_df.empty:
                 ctk.CTkLabel(
                     self.watch_scroll,
-                    text="지켜볼 종목을 추가하면\n가격 흐름을 여기서 바로 볼 수 있어요.",
+                    text="관심 종목을 추가하면\n가격 흐름을 여기서 바로 볼 수 있어요.",
                     font=(self.font_family, 14),
                     text_color="#8B95A1",
                     justify="center",
