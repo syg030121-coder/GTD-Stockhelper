@@ -4,7 +4,7 @@ import urllib.parse
 import requests
 import threading
 import re
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk, ImageDraw, ImageChops
 import io
 import customtkinter as ctk
 import pandas as pd
@@ -139,12 +139,33 @@ class GTDApp:
             return None
 
         try:
-            src = Image.open(logo_path).convert("RGBA")
-            src = src.crop((110, 60, 530, 315))
+            with Image.open(logo_path) as logo_file:
+                src = logo_file.convert("RGBA")
+
+            # 로고 파일 크기가 바뀌어도 흰 여백만 자동으로 제거하고 원본 비율은 유지한다.
+            rgb = src.convert("RGB")
+            white_background = Image.new("RGB", rgb.size, "white")
+            difference = ImageChops.difference(rgb, white_background).convert("L")
+            content_mask = difference.point(lambda value: 255 if value > 8 else 0)
+            content_box = content_mask.getbbox()
+            if content_box:
+                padding = max(8, int(min(src.size) * 0.015))
+                left = max(0, content_box[0] - padding)
+                top = max(0, content_box[1] - padding)
+                right = min(src.width, content_box[2] + padding)
+                bottom = min(src.height, content_box[3] + padding)
+                src = src.crop((left, top, right, bottom))
+
+            max_width, max_height = 160, 112
+            scale = min(max_width / src.width, max_height / src.height)
+            display_size = (
+                max(1, round(src.width * scale)),
+                max(1, round(src.height * scale)),
+            )
             self.brand_logo_image = ctk.CTkImage(
                 light_image=src,
                 dark_image=src,
-                size=(190, 115),
+                size=display_size,
             )
             return self.brand_logo_image
         except Exception:
@@ -555,6 +576,64 @@ class GTDApp:
             return "AAPL"
         return "GENERIC"
 
+    def _is_economic_news_title(self, title):
+        """대시보드에는 기업 개별 이슈가 아닌 거시경제 기사만 노출한다."""
+        economic_keywords = [
+            "경제", "경기", "금리", "기준금리", "물가", "소비자물가", "생산자물가",
+            "환율", "원/달러", "달러", "고용", "실업", "국내총생산", "성장률",
+            "gdp", "cpi", "ppi", "fomc", "연준", "한국은행", "통화정책", "재정",
+            "무역", "수출", "수입", "관세", "국채", "채권", "유가", "원유",
+            "경기침체", "소비", "소매판매", "산업생산",
+        ]
+        normalized = re.sub(r"\s+", "", str(title or "")).lower()
+        if not any(re.sub(r"\s+", "", keyword).lower() in normalized for keyword in economic_keywords):
+            return False
+        if self._get_news_symbol_from_title(title) != "GENERIC":
+            return False
+
+        company_event_keywords = [
+            "신제품", "출시", "수주", "계약", "공시", "목표주가", "증권사",
+            "영업이익", "매출", "분기실적", "주가급등", "주가급락",
+        ]
+        return not any(keyword in normalized for keyword in company_event_keywords)
+
+    def _stock_news_aliases(self, stock_name, symbol):
+        clean_symbol = str(symbol or "").split(".")[0].upper()
+        raw_name = str(stock_name or "").strip()
+        simplified_name = re.sub(
+            r"(?i)\b(?:inc|corp|corporation|co|ltd|limited|holdings?)\.?\b",
+            "",
+            raw_name,
+        )
+        simplified_name = re.sub(r"주식회사|\(주\)|㈜", "", simplified_name)
+        simplified_name = re.sub(r"\s+", " ", simplified_name).strip(" .,-")
+
+        aliases = {raw_name, simplified_name}
+        known_aliases = {
+            "005930": ("삼성전자",), "000660": ("SK하이닉스", "하이닉스"),
+            "035420": ("네이버", "NAVER"), "035720": ("카카오",),
+            "005380": ("현대차", "현대자동차"), "000270": ("기아",),
+            "068270": ("셀트리온",), "AAPL": ("애플", "Apple"),
+            "MSFT": ("마이크로소프트", "Microsoft"),
+            "GOOGL": ("알파벳", "구글", "Google"), "GOOG": ("알파벳", "구글", "Google"),
+            "AMZN": ("아마존", "Amazon"), "NVDA": ("엔비디아", "Nvidia"),
+            "TSLA": ("테슬라", "Tesla"), "META": ("메타", "Meta"),
+            "MU": ("마이크론", "Micron"), "AMD": ("AMD",),
+        }.get(clean_symbol, ())
+        aliases.update(known_aliases)
+        if clean_symbol and not clean_symbol.isdigit():
+            aliases.add(clean_symbol)
+
+        return {
+            re.sub(r"\s+", "", alias).lower()
+            for alias in aliases
+            if alias and len(re.sub(r"\s+", "", alias)) >= 2
+        }
+
+    def _is_stock_related_news_title(self, title, stock_name, symbol):
+        normalized_title = re.sub(r"\s+", "", str(title or "")).lower()
+        return any(alias in normalized_title for alias in self._stock_news_aliases(stock_name, symbol))
+
     def _is_probable_news_title_link(self, anchor):
         title = anchor.get_text(" ", strip=True)
         href = anchor.get("href", "")
@@ -596,7 +675,7 @@ class GTDApp:
         if link and str(link).startswith("http"):
             webbrowser.open_new_tab(link)
 
-    def _fetch_recent_naver_news(self, query, limit=3, seen_titles=None):
+    def _fetch_recent_naver_news(self, query, limit=3, seen_titles=None, title_filter=None):
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
@@ -617,6 +696,8 @@ class GTDApp:
             title = a.get_text(" ", strip=True)
             href = a.get('href', '')
             if not href.startswith('http') or len(title) < 10:
+                continue
+            if title_filter is not None and not title_filter(title):
                 continue
             if title in seen_titles or href in seen_links:
                 continue
@@ -751,7 +832,7 @@ class GTDApp:
         brand_logo = self.get_brand_logo_image()
         if brand_logo:
             ctk.CTkLabel(self.sidebar, text="", image=brand_logo).pack(
-                pady=(24, 42), padx=24, anchor="w"
+                fill="x", pady=(24, 42), padx=20
             )
         else:
             ctk.CTkLabel(self.sidebar, text="📊 GTD", font=(self.font_family, 32, "bold"), text_color="#3182F6").pack(pady=(30, 4), padx=25, anchor="w")
@@ -948,7 +1029,7 @@ class GTDApp:
         self.news_card.pack(fill=card_fill, expand=card_expand, pady=(0, 10))
         self._render_card_header(
             self.news_card,
-            "24시간 주요 뉴스",
+            "24시간 경제 뉴스",
             "제목이나 기사 버튼을 누르면 원문을 열고, 분석 버튼으로 쉬운 해설을 볼 수 있어요.",
         )
         self.news_scroll = ctk.CTkFrame(self.news_card, fg_color="transparent")
@@ -1241,7 +1322,7 @@ class GTDApp:
             if not daily_news:
                 ctk.CTkLabel(
                     self.news_scroll,
-                    text="최근 24시간 내 주요 증시 뉴스를 불러오지 못했습니다. 새로고침 후 다시 확인해 주세요.",
+                    text="최근 24시간 내 경제 뉴스를 불러오지 못했습니다. 새로고침 후 다시 확인해 주세요.",
                     font=(self.font_family, 13),
                     text_color="#8B95A1",
                     wraplength=news_wrap,
@@ -1520,7 +1601,7 @@ class GTDApp:
         self.render_dashboard_tab()
 
     def get_daily_cached_news(self):
-        """최근 24시간 이내의 대형 증시 뉴스 3가지 연동"""
+        """최근 24시간 이내의 거시경제 뉴스 3가지를 연동한다."""
         now = self._get_local_now()
         today_str = now.strftime("%Y-%m-%d")
         if (
@@ -1534,15 +1615,20 @@ class GTDApp:
         seen_titles = set()
         try:
             queries = [
-                "증시 주요 뉴스",
-                "코스피 나스닥 증시",
-                "주식시장 호재 악재",
+                "경제 금리 물가 환율",
+                "한국은행 기준금리 경제",
+                "미국 연준 고용 물가 경제",
             ]
             for query in queries:
                 if len(news_list) >= 3:
                     break
                 needed = 3 - len(news_list)
-                news_list.extend(self._fetch_recent_naver_news(query, limit=needed, seen_titles=seen_titles))
+                news_list.extend(self._fetch_recent_naver_news(
+                    query,
+                    limit=needed,
+                    seen_titles=seen_titles,
+                    title_filter=self._is_economic_news_title,
+                ))
         except Exception as e:
             print(f"[디버깅] 뉴스 연동 오류: {e}")
 
@@ -1551,11 +1637,11 @@ class GTDApp:
 
         if not news_list:
             news_list.append({
-                "title": "최근 24시간 주요 증시 뉴스를 불러오지 못했습니다. 최신 검색 결과 열기",
+                "title": "최근 24시간 경제 뉴스를 불러오지 못했습니다. 최신 검색 결과 열기",
                 "symbol": "GENERIC",
                 "sentiment": "복합",
                 "sentiment_reason": "네이버 최신순 검색 링크",
-                "link": self._build_naver_news_url("증시 주요 뉴스"),
+                "link": self._build_naver_news_url("경제 금리 물가 환율"),
                 "age_label": "실시간 검색",
                 "published_at": "",
                 "is_notice": True,
@@ -2889,7 +2975,12 @@ class GTDApp:
 
             news_header = ctk.CTkFrame(self.news_timeline, fg_color="transparent")
             news_header.pack(fill="x", padx=20, pady=(15, 5))
-            ctk.CTkLabel(news_header, text="📰 24시간 신규 실시간 뉴스 피드", font=(self.font_family, 16, "bold"), text_color="#191F28").pack(side="left")
+            ctk.CTkLabel(
+                news_header,
+                text=f"📰 {stock_name_only} 관련 24시간 뉴스",
+                font=(self.font_family, 16, "bold"),
+                text_color="#191F28",
+            ).pack(side="left")
 
             self.btn_news_refresh = ctk.CTkButton(
                 news_header, text="🔄 뉴스 새로고침", width=110, height=28, font=(self.font_family, 12, "bold"),
@@ -3562,20 +3653,34 @@ class GTDApp:
         loading_lbl.pack(anchor="w", pady=10)
 
         sector_name = self.get_stock_sector_info(symbol)["sector"]
-        threading.Thread(target=self.fetch_stock_detail_news_async, args=(stock_name, sector_name), daemon=True).start()
+        threading.Thread(
+            target=self.fetch_stock_detail_news_async,
+            args=(stock_name, symbol, sector_name),
+            daemon=True,
+        ).start()
 
-    def fetch_stock_detail_news_async(self, stock_name, sector_name):
-        news_list = self.crawl_filtered_news_for_stock(stock_name, sector_name)
+    def fetch_stock_detail_news_async(self, stock_name, symbol, sector_name):
+        news_list = self.crawl_filtered_news_for_stock(stock_name, symbol)
         self.root.after(0, lambda: self.render_stock_detail_news_ui(news_list, sector_name))
 
-    def crawl_filtered_news_for_stock(self, stock_name, sector_name):
-        """24시간 이내의 뉴스를 불러오되 중복을 제거(이전에 불러오지 않은 뉴스)"""
+    def crawl_filtered_news_for_stock(self, stock_name, symbol):
+        """최근 24시간 기사 중 선택한 종목이 제목에 명시된 뉴스만 반환한다."""
         news_results = []
-        queries = [f"{stock_name} 주가", f"{sector_name} 뉴스"]
+        queries = [f"{stock_name} 주가", f"{stock_name} 실적"]
+        title_filter = lambda title: self._is_stock_related_news_title(
+            title,
+            stock_name,
+            symbol,
+        )
 
         for q in queries:
             try:
-                fetched = self._fetch_recent_naver_news(q, limit=3, seen_titles=self.shown_news_titles)
+                fetched = self._fetch_recent_naver_news(
+                    q,
+                    limit=3,
+                    seen_titles=self.shown_news_titles,
+                    title_filter=title_filter,
+                )
                 for item in fetched:
                     sentiment, reason = self._classify_news_sentiment(item["title"])
                     item["sentiment"] = sentiment
