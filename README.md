@@ -1,3 +1,9 @@
+
+
+https://github.com/user-attachments/assets/735064a2-38a5-49f4-817e-d756ee99a9f2
+
+
+
 # GTD-Stockhelper
 
 GTD는 초보 투자자가 투자 근거를 기록하고, 보유 종목과 관심 종목의 시세·뉴스·재무 정보를 한 화면에서 확인하도록 돕는 Python 데스크톱 앱입니다.
