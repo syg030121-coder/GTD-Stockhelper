@@ -24,6 +24,11 @@ class GTDApp:
         self.init_storage()
         self.current_user = None
         self.active_tab = "dashboard"
+        self.dashboard_outer_padding = 24
+        self.dashboard_section_gap = 16
+        self.dashboard_breakpoint = 960
+        self._dashboard_layout_mode = None
+        self._dashboard_resize_job = None
 
         # 3. 폰트 동적 정의
         try:
@@ -78,8 +83,18 @@ class GTDApp:
         # 5. 메인 윈도우 생성
         self.root = ctk.CTk()
         self.root.title("GTD - 근거있는 투자 도우미")
-        self.root.geometry("820x600+10+10")
-        self.root.minsize(760, 520)
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        window_width = min(1600, max(1100, int(screen_width * 0.92)))
+        window_height = min(1000, max(700, int(screen_height * 0.90)))
+        window_x = max(0, (screen_width - window_width) // 2)
+        window_y = max(0, (screen_height - window_height) // 2)
+        self.root.geometry(f"{window_width}x{window_height}+{window_x}+{window_y}")
+        self.root.minsize(960, 640)
+        try:
+            self.root.state("zoomed")
+        except Exception:
+            pass
         self.root.configure(fg_color="#F9FAFB")
 
         # 글로벌 새로고침 단축키 바인딩
@@ -131,18 +146,63 @@ class GTDApp:
         except Exception:
             return None
 
-    def _use_compact_dashboard(self):
+    def _dashboard_content_size(self):
         try:
-            widget_scale = ctk.ScalingTracker.get_widget_scaling(self.root)
+            width = self.content_area.winfo_width()
+            height = self.content_area.winfo_height()
         except Exception:
-            widget_scale = 1.0
-        return self.root.winfo_screenwidth() <= 1600 or widget_scale >= 1.5
+            width = 0
+            height = 0
+
+        if width <= 1:
+            width = max(1, self.root.winfo_width() - 220)
+        if height <= 1:
+            height = max(1, self.root.winfo_height())
+        return width, height
+
+    def _use_compact_dashboard(self):
+        width, height = self._dashboard_content_size()
+        aspect_ratio = width / max(height, 1)
+        return width < self.dashboard_breakpoint or aspect_ratio < 1.2
+
+    def _handle_dashboard_resize(self, event):
+        if self.active_tab != "dashboard" or event.width <= 1:
+            return
+
+        next_mode = "compact" if self._use_compact_dashboard() else "wide"
+        if next_mode == self._dashboard_layout_mode:
+            return
+
+        if self._dashboard_resize_job is not None:
+            try:
+                self.root.after_cancel(self._dashboard_resize_job)
+            except Exception:
+                pass
+        self._dashboard_resize_job = self.root.after(180, self._rebuild_dashboard_layout)
+
+    def _rebuild_dashboard_layout(self):
+        self._dashboard_resize_job = None
+        next_mode = "compact" if self._use_compact_dashboard() else "wide"
+        if (
+            self.active_tab == "dashboard"
+            and self.is_widget_alive("content_area")
+            and next_mode != self._dashboard_layout_mode
+        ):
+            self.switch_tab("dashboard")
 
     def _content_wraplength(self, max_width=620, min_width=320, reserve=420):
+        width, _ = self._dashboard_content_size()
+        return max(min_width, min(max_width, width - reserve))
+
+    def _widget_wraplength(self, widget, max_width=900, min_width=280, reserve=80):
         try:
-            width = self.content_area.winfo_width() or self.root.winfo_width()
+            width = widget.winfo_width()
         except Exception:
-            width = self.root.winfo_screenwidth()
+            width = 0
+        if width <= 1:
+            width, _ = self._dashboard_content_size()
+            if not self._use_compact_dashboard():
+                width = width // 2
         return max(min_width, min(max_width, width - reserve))
 
     def _render_card_header(self, parent, title, subtitle="", title_color="#191F28"):
@@ -160,13 +220,17 @@ class GTDApp:
                 text=subtitle,
                 font=(self.font_family, 12),
                 text_color="#8B95A1",
-                wraplength=self._content_wraplength(max_width=620, reserve=460),
+                wraplength=self._widget_wraplength(parent, max_width=900, reserve=56),
                 justify="left",
             ).pack(anchor="w", pady=(3, 0))
 
     def _render_dashboard_notice(self, parent):
         notice = ctk.CTkFrame(parent, fg_color="#FFF7E8", corner_radius=14)
-        notice.pack(fill="x", padx=30, pady=(0, 14))
+        notice.pack(
+            fill="x",
+            padx=self.dashboard_outer_padding,
+            pady=(0, self.dashboard_section_gap),
+        )
         badge = ctk.CTkLabel(
             notice,
             text="초보자 모드",
@@ -183,7 +247,7 @@ class GTDApp:
             text="1 투자 상태 -> 2 뉴스 -> 3 관심 종목",
             font=(self.font_family, 14, "bold"),
             text_color="#4E5968",
-            wraplength=460,
+            wraplength=self._content_wraplength(max_width=1100, reserve=180),
             anchor="w",
             justify="left",
         ).pack(side="left", fill="x", expand=True, padx=(0, 18), pady=14)
@@ -196,7 +260,11 @@ class GTDApp:
             border_color="#E5E8EB",
             corner_radius=18,
         )
-        overview.pack(fill="x", padx=30, pady=(0, 14))
+        overview.pack(
+            fill="x",
+            padx=self.dashboard_outer_padding,
+            pady=(0, self.dashboard_section_gap),
+        )
 
         top = ctk.CTkFrame(overview, fg_color="transparent")
         top.pack(fill="x", padx=20, pady=(16, 6))
@@ -608,8 +676,10 @@ class GTDApp:
         # 2. 우측 메인 콘텐츠 프레임
         self.content_area = ctk.CTkFrame(self.main_container, fg_color="#F9FAFB", corner_radius=0)
         self.content_area.pack(side="right", fill="both", expand=True)
+        self.content_area.bind("<Configure>", self._handle_dashboard_resize)
 
         self.render_sidebar()
+        self.root.update_idletasks()
         self.switch_tab("dashboard")
 
     def render_sidebar(self):
@@ -624,7 +694,8 @@ class GTDApp:
 
         tabs = [
             ("dashboard", "대시보드"),
-            ("portfolio", "나의 종목")
+            ("portfolio", "나의 종목"),
+            ("settings", "설정"),
         ]
 
         self.sidebar_buttons = {}
@@ -673,17 +744,20 @@ class GTDApp:
             self.render_dashboard_tab()
         elif tab_name == "portfolio":
             self.render_portfolio_tab()
+        elif tab_name == "settings":
+            self.render_settings_tab()
 
     def render_dashboard_tab(self):
         """메인 대시보드 화면 구성"""
         # ── 스크롤 가능한 전체 컨텐츠 래퍼
+        self._dashboard_layout_mode = "compact" if self._use_compact_dashboard() else "wide"
         dash_scroll = ctk.CTkScrollableFrame(self.content_area, fg_color="transparent")
         dash_scroll.pack(fill="both", expand=True)
         try:
             dash_scroll._parent_canvas.bind(
                 "<Configure>",
                 lambda event, frame=dash_scroll: frame._parent_canvas.itemconfigure(
-                    frame._create_window_id, width=min(event.width, 700)
+                    frame._create_window_id, width=max(1, event.width)
                 )
             )
         except Exception:
@@ -691,7 +765,11 @@ class GTDApp:
 
         # ── 헤더 ──────────────────────────────────────────────────────
         header_frame = ctk.CTkFrame(dash_scroll, fg_color="transparent")
-        header_frame.pack(fill="x", padx=30, pady=(24, 10))
+        header_frame.pack(
+            fill="x",
+            padx=self.dashboard_outer_padding,
+            pady=(24, 12),
+        )
         header_text = ctk.CTkFrame(header_frame, fg_color="transparent")
         header_text.pack(side="left", fill="x", expand=True)
         ctk.CTkLabel(
@@ -705,7 +783,7 @@ class GTDApp:
             text=f"{self.current_user}님, 내 종목과 최근 뉴스부터 확인해요.",
             font=(self.font_family, 13),
             text_color="#8B95A1",
-            wraplength=520,
+            wraplength=self._content_wraplength(max_width=1100, reserve=220),
             justify="left",
         ).pack(anchor="w", pady=(2, 0))
         ctk.CTkButton(header_frame, text="새로고침", width=90, height=34,
@@ -725,13 +803,21 @@ class GTDApp:
             border_color="#E5E8EB",
             corner_radius=20,
         )
-        self.return_banner.pack(fill="x", padx=30, pady=(0, 14))
+        self.return_banner.pack(
+            fill="x",
+            padx=self.dashboard_outer_padding,
+            pady=(0, self.dashboard_section_gap),
+        )
         self._return_banner_loading()
 
         # ── 투자 비율 차트 영역 ─────────────────────────────────────────
         alloc_card = ctk.CTkFrame(dash_scroll, fg_color="#FFFFFF",
                                    border_width=1, border_color="#E5E8EB", corner_radius=20)
-        alloc_card.pack(fill="x", padx=30, pady=(0, 14))
+        alloc_card.pack(
+            fill="x",
+            padx=self.dashboard_outer_padding,
+            pady=(0, self.dashboard_section_gap),
+        )
         alloc_hdr = ctk.CTkFrame(alloc_card, fg_color="transparent")
         alloc_hdr.pack(fill="x", padx=20, pady=(16, 6))
         ctk.CTkLabel(alloc_hdr, text="내 돈이 어디에 들어가 있나요?",
@@ -741,7 +827,7 @@ class GTDApp:
             text="종목을 추가하면 종목별, 섹터별, 국내·미국장 비율을 한눈에 보여드려요.",
             font=(self.font_family, 12),
             text_color="#8B95A1",
-            wraplength=560,
+            wraplength=self._content_wraplength(max_width=1200, reserve=80),
             justify="left",
         ).pack(anchor="w", padx=20, pady=(0, 8))
 
@@ -753,7 +839,12 @@ class GTDApp:
         # ── 메인 2열 분할 ───────────────────────────────────────────────
         compact_dashboard = self._use_compact_dashboard()
         main_split = ctk.CTkFrame(dash_scroll, fg_color="transparent")
-        main_split.pack(fill="both", expand=True, padx=30, pady=(0, 20))
+        main_split.pack(
+            fill="both",
+            expand=True,
+            padx=self.dashboard_outer_padding,
+            pady=(0, self.dashboard_outer_padding),
+        )
         if not compact_dashboard:
             main_split.columnconfigure(0, weight=5)
             main_split.columnconfigure(1, weight=5)
@@ -767,8 +858,9 @@ class GTDApp:
             card_fill = "x"
             card_expand = False
         else:
-            left_col.grid(row=0, column=0, padx=(0, 10), sticky="nsew")
-            right_col.grid(row=0, column=1, padx=(10, 0), sticky="nsew")
+            column_gap = self.dashboard_section_gap // 2
+            left_col.grid(row=0, column=0, padx=(0, column_gap), sticky="nsew")
+            right_col.grid(row=0, column=1, padx=(column_gap, 0), sticky="nsew")
             card_fill = "both"
             card_expand = True
 
@@ -1075,7 +1167,12 @@ class GTDApp:
 
         if self.is_widget_alive("news_scroll"):
             for w in self.news_scroll.winfo_children(): w.destroy()
-            news_wrap = self._content_wraplength(max_width=760, min_width=360, reserve=390) if self._use_compact_dashboard() else 430
+            news_wrap = self._widget_wraplength(
+                self.news_scroll,
+                max_width=900,
+                min_width=280,
+                reserve=72,
+            )
             if not daily_news:
                 ctk.CTkLabel(
                     self.news_scroll,
@@ -1449,7 +1546,10 @@ class GTDApp:
         def call_ai():
             try:
                 from google import genai as gai
-                client = gai.Client(api_key=config.GEMINI_API_KEY)
+                api_key = config.get_gemini_api_key()
+                if not api_key:
+                    raise RuntimeError("설정에서 Gemini API 키를 먼저 저장해 주세요.")
+                client = gai.Client(api_key=api_key)
                 if sentiment == "호재":
                     prompt = f"""다음 주식 뉴스가 왜 호재(좋은 소식)인지 초보 투자자도 이해할 수 있게 설명해주세요.
 
@@ -1536,7 +1636,10 @@ class GTDApp:
 
         try:
             from google import genai as gai
-            client = gai.Client(api_key=config.GEMINI_API_KEY)
+            api_key = config.get_gemini_api_key()
+            if not api_key:
+                raise RuntimeError("설정에서 Gemini API 키를 먼저 저장해 주세요.")
+            client = gai.Client(api_key=api_key)
             prompt = """오늘 날짜 기준으로 한국 및 글로벌 주식 시장에서 이번 주 가장 주목받는 섹터 1개를 선정하고,
 관련 대표 종목 4개(국내 2개, 미국 2개)를 추천해주세요.
 
@@ -1576,6 +1679,212 @@ class GTDApp:
             ]
             return fallback[week_num % len(fallback)]
 
+
+    def render_settings_tab(self):
+        settings_page = ctk.CTkScrollableFrame(
+            self.content_area,
+            fg_color="transparent",
+        )
+        settings_page.pack(fill="both", expand=True)
+
+        content = ctk.CTkFrame(settings_page, fg_color="transparent")
+        content.pack(
+            fill="x",
+            padx=self.dashboard_outer_padding,
+            pady=(28, self.dashboard_outer_padding),
+        )
+
+        ctk.CTkLabel(
+            content,
+            text="설정",
+            font=(self.font_family, 26, "bold"),
+            text_color="#191F28",
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            content,
+            text="AI 연결 정보를 이 PC에 저장합니다.",
+            font=(self.font_family, 13),
+            text_color="#8B95A1",
+        ).pack(anchor="w", pady=(4, 20))
+
+        api_card = ctk.CTkFrame(
+            content,
+            fg_color="#FFFFFF",
+            border_width=1,
+            border_color="#E5E8EB",
+            corner_radius=8,
+        )
+        api_card.pack(fill="x")
+
+        ctk.CTkLabel(
+            api_card,
+            text="Gemini AI",
+            font=(self.font_family, 18, "bold"),
+            text_color="#191F28",
+        ).pack(anchor="w", padx=22, pady=(20, 4))
+        ctk.CTkLabel(
+            api_card,
+            text="Google AI Studio에서 발급한 API 키",
+            font=(self.font_family, 12),
+            text_color="#8B95A1",
+        ).pack(anchor="w", padx=22, pady=(0, 12))
+
+        key_entry = ctk.CTkEntry(
+            api_card,
+            height=44,
+            font=(self.font_family, 13),
+            placeholder_text="Gemini API 키를 입력하세요",
+            show="*",
+            border_color="#D1D6DB",
+            corner_radius=8,
+        )
+        key_entry.pack(fill="x", padx=22)
+        saved_key = config.get_gemini_api_key()
+        if saved_key:
+            key_entry.insert(0, saved_key)
+
+        option_row = ctk.CTkFrame(api_card, fg_color="transparent")
+        option_row.pack(fill="x", padx=22, pady=(10, 6))
+        show_key_var = ctk.BooleanVar(value=False)
+
+        def toggle_key_visibility():
+            key_entry.configure(show="" if show_key_var.get() else "*")
+
+        ctk.CTkCheckBox(
+            option_row,
+            text="API 키 표시",
+            variable=show_key_var,
+            command=toggle_key_visibility,
+            font=(self.font_family, 12),
+            text_color="#4E5968",
+            width=110,
+            checkbox_width=18,
+            checkbox_height=18,
+        ).pack(side="left")
+        ctk.CTkButton(
+            option_row,
+            text="키 발급 페이지",
+            width=100,
+            height=30,
+            font=(self.font_family, 11, "bold"),
+            fg_color="transparent",
+            text_color="#3182F6",
+            hover_color="#E8F3FF",
+            command=lambda: self._open_url("https://aistudio.google.com/app/apikey"),
+        ).pack(side="left", padx=(12, 0))
+
+        status_label = ctk.CTkLabel(
+            api_card,
+            text="저장된 API 키가 있습니다." if saved_key else "저장된 API 키가 없습니다.",
+            font=(self.font_family, 12),
+            text_color="#3182F6" if saved_key else "#8B95A1",
+        )
+        status_label.pack(anchor="w", padx=22, pady=(2, 8))
+
+        button_row = ctk.CTkFrame(api_card, fg_color="transparent")
+        button_row.pack(fill="x", padx=22, pady=(0, 20))
+
+        def set_status(message, color):
+            try:
+                if status_label.winfo_exists():
+                    status_label.configure(text=message, text_color=color)
+            except Exception:
+                pass
+
+        def save_key():
+            api_key = key_entry.get().strip()
+            if len(api_key) < 20:
+                set_status("올바른 Gemini API 키를 입력해 주세요.", "#F04452")
+                return
+            try:
+                config.save_gemini_api_key(api_key)
+                self._sector_ai_cache = None
+                set_status("API 키를 저장했습니다.", "#00A878")
+            except Exception as error:
+                set_status(f"저장하지 못했습니다: {error}", "#F04452")
+
+        def delete_key():
+            try:
+                config.save_gemini_api_key("")
+                key_entry.delete(0, "end")
+                self._sector_ai_cache = None
+                set_status("저장된 API 키를 삭제했습니다.", "#4E5968")
+            except Exception as error:
+                set_status(f"삭제하지 못했습니다: {error}", "#F04452")
+
+        test_button = ctk.CTkButton(
+            button_row,
+            text="연결 테스트",
+            width=100,
+            height=38,
+            font=(self.font_family, 12, "bold"),
+            fg_color="#E8F3FF",
+            text_color="#3182F6",
+            hover_color="#D0E6FF",
+            corner_radius=8,
+        )
+
+        def test_key():
+            api_key = key_entry.get().strip()
+            if len(api_key) < 20:
+                set_status("테스트할 Gemini API 키를 입력해 주세요.", "#F04452")
+                return
+            test_button.configure(text="확인 중...", state="disabled")
+            set_status("Gemini 연결을 확인하고 있습니다.", "#3182F6")
+
+            def run_test():
+                try:
+                    from google import genai as gai
+                    client = gai.Client(api_key=api_key)
+                    response = client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents="연결 확인",
+                    )
+                    if not getattr(response, "text", ""):
+                        raise RuntimeError("응답을 받지 못했습니다.")
+                    message = "Gemini 연결에 성공했습니다."
+                    color = "#00A878"
+                except Exception as error:
+                    message = f"연결에 실패했습니다: {error}"
+                    color = "#F04452"
+
+                def finish_test():
+                    try:
+                        if test_button.winfo_exists():
+                            test_button.configure(text="연결 테스트", state="normal")
+                            set_status(message, color)
+                    except Exception:
+                        pass
+
+                self.root.after(0, finish_test)
+
+            threading.Thread(target=run_test, daemon=True).start()
+
+        test_button.configure(command=test_key)
+        test_button.pack(side="left")
+        ctk.CTkButton(
+            button_row,
+            text="저장",
+            width=90,
+            height=38,
+            font=(self.font_family, 12, "bold"),
+            fg_color="#3182F6",
+            hover_color="#1B64DA",
+            corner_radius=8,
+            command=save_key,
+        ).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(
+            button_row,
+            text="삭제",
+            width=80,
+            height=38,
+            font=(self.font_family, 12, "bold"),
+            fg_color="#F2F4F6",
+            text_color="#F04452",
+            hover_color="#FFECEF",
+            corner_radius=8,
+            command=delete_key,
+        ).pack(side="left", padx=(8, 0))
 
     def render_portfolio_tab(self):
         """포트폴리오 관리 탭"""
@@ -2384,10 +2693,10 @@ class GTDApp:
             def call_gemini():
                 try:
                     from google import genai as gai
-                    api_key = config.GEMINI_API_KEY
+                    api_key = config.get_gemini_api_key()
                     if not api_key:
                         self.root.after(0, lambda: _show_ai_error(
-                            "API 키가 없습니다.\nconfig.py 파일에 GEMINI_API_KEY를 입력해주세요."))
+                            "API 키가 없습니다.\n앱의 설정 화면에서 Gemini API 키를 저장해 주세요."))
                         return
                     client = gai.Client(api_key=api_key)
 
